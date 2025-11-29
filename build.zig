@@ -248,6 +248,13 @@ fn ensureXrRegistry(b: *std.Build) std.Build.LazyPath {
     return b.path(xml_rel);
 }
 
+/// Tiny helper mirroring ZTable style: add a `zig test` for a module and
+/// wrap it in a run step so it participates in the build graph cleanly.
+fn addTestRun(b: *std.Build, root_mod: *std.Build.Module) *std.Build.Step.Run {
+    const t = b.addTest(.{ .root_module = root_mod });
+    return b.addRunArtifact(t);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -294,7 +301,37 @@ pub fn build(b: *std.Build) void {
     });
 
     // ─────────────────────────────────────────────────────────────────────
-    // Root module for vrgame
+    // Internal modules (full module wiring, ZTable-style)
+    // ─────────────────────────────────────────────────────────────────────
+
+    const vertex_mod = b.createModule(.{
+        .root_source_file = b.path("src/graphics/vertex.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vertex_mod.addImport("vulkan", vk_mod);
+
+    const graphics_context_mod = b.createModule(.{
+        .root_source_file = b.path("src/graphics/graphics_context.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    graphics_context_mod.addImport("glfw", glfw_mod);
+    graphics_context_mod.addImport("vulkan", vk_mod);
+    graphics_context_mod.addImport("openxr", xr_mod);
+    graphics_context_mod.addImport("vertex", vertex_mod);
+
+    const swapchain_mod = b.createModule(.{
+        .root_source_file = b.path("src/graphics/swapchain.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    swapchain_mod.addImport("vulkan", vk_mod);
+    swapchain_mod.addImport("graphics_context", graphics_context_mod);
+    swapchain_mod.addImport("vertex", vertex_mod);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Root module for vrgame (exe entrypoint)
     // ─────────────────────────────────────────────────────────────────────
 
     const exe_mod = b.createModule(.{
@@ -306,6 +343,9 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("glfw", glfw_mod);
     exe_mod.addImport("vulkan", vk_mod);
     exe_mod.addImport("openxr", xr_mod); // use as: const xr = @import("openxr");
+    exe_mod.addImport("graphics_context", graphics_context_mod);
+    exe_mod.addImport("swapchain", swapchain_mod);
+    exe_mod.addImport("vertex", vertex_mod);
 
     // ─────────────────────────────────────────────────────────────────────
     // Shader compilation (glslc → SPIR-V → @embedFile)
@@ -338,7 +378,9 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
-    // The executable must wait for the OpenXR bindings to be generated.
+    // The executable (and any tests importing openxr) must wait for the
+    // OpenXR bindings to be generated. Using xr_zig as root_source_file
+    // already wires the dependency; this is just an explicit reminder.
     exe.step.dependOn(&xr_gen_cmd.step);
 
     // Pull in glfw-zig (which brings GLFW C and platform libs along).
@@ -360,4 +402,92 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the Vulkan + OpenXR triangle demo");
     run_step.dependOn(&run_cmd.step);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Tests – ZTable-style, but per-module (no test_all_unit.zig)
+    // ─────────────────────────────────────────────────────────────────────
+
+    const unit_step = b.step("test-unit", "Run unit tests (vrgame modules)");
+    const integration_step = b.step("test-integration", "Run integration tests");
+    const e2e_step = b.step("test-e2e", "Run end-to-end tests");
+
+    // --- Unit: each module runs its inline `test` blocks ------------------
+
+    const run_main_tests = addTestRun(b, exe_mod);
+    const run_graphics_context_tests = addTestRun(b, graphics_context_mod);
+    const run_swapchain_tests = addTestRun(b, swapchain_mod);
+    const run_vertex_tests = addTestRun(b, vertex_mod);
+
+    unit_step.dependOn(&run_main_tests.step);
+    unit_step.dependOn(&run_graphics_context_tests.step);
+    unit_step.dependOn(&run_swapchain_tests.step);
+    unit_step.dependOn(&run_vertex_tests.step);
+
+    // --- Integration (optional aggregator: tests/test_all_integration.zig) --
+
+    const have_integration = blk: {
+        _ = std.fs.cwd().statFile("tests/test_all_integration.zig") catch break :blk false;
+        break :blk true;
+    };
+    if (have_integration) {
+        const integration_mod = b.createModule(.{
+            .root_source_file = b.path("tests/test_all_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        // Give integration tests access to the same named modules.
+        integration_mod.addImport("glfw", glfw_mod);
+        integration_mod.addImport("vulkan", vk_mod);
+        integration_mod.addImport("openxr", xr_mod);
+        integration_mod.addImport("graphics_context", graphics_context_mod);
+        integration_mod.addImport("swapchain", swapchain_mod);
+        integration_mod.addImport("vertex", vertex_mod);
+
+        const integration_tests = b.addTest(.{ .root_module = integration_mod });
+        const run_integration = b.addRunArtifact(integration_tests);
+        integration_step.dependOn(&run_integration.step);
+    }
+
+    // --- E2E (optional aggregator: tests/test_all_e2e.zig) -----------------
+
+    const have_e2e = blk: {
+        _ = std.fs.cwd().statFile("tests/test_all_e2e.zig") catch break :blk false;
+        break :blk true;
+    };
+    if (have_e2e) {
+        const e2e_mod = b.createModule(.{
+            .root_source_file = b.path("tests/test_all_e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        e2e_mod.addImport("glfw", glfw_mod);
+        e2e_mod.addImport("vulkan", vk_mod);
+        e2e_mod.addImport("openxr", xr_mod);
+        e2e_mod.addImport("graphics_context", graphics_context_mod);
+        e2e_mod.addImport("swapchain", swapchain_mod);
+        e2e_mod.addImport("vertex", vertex_mod);
+
+        const e2e_tests = b.addTest(.{ .root_module = e2e_mod });
+        const run_e2e = b.addRunArtifact(e2e_tests);
+        e2e_step.dependOn(&run_e2e.step);
+    }
+
+    // --- Aggregates --------------------------------------------------------
+
+    const test_all_step = b.step(
+        "test-all",
+        "Build vrgame and run unit + integration + e2e tests",
+    );
+    // Make sure the game still builds as part of the pipeline.
+    test_all_step.dependOn(b.getInstallStep());
+    test_all_step.dependOn(unit_step);
+    test_all_step.dependOn(integration_step);
+    test_all_step.dependOn(e2e_step);
+
+    // Alias: `zig build test` == `zig build test-all`.
+    const test_step = b.step("test", "Alias for test-all");
+    test_step.dependOn(test_all_step);
+
+    // Default: `zig build` runs the full suite.
+    b.default_step = test_all_step;
 }

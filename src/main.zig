@@ -2,9 +2,10 @@ const std = @import("std");
 const glfw = @import("glfw");
 const vk = @import("vulkan");
 
-const GraphicsContext = @import("./graphics/graphics_context.zig").GraphicsContext;
-const Swapchain = @import("./graphics/swapchain.zig").Swapchain;
-const Vertex = @import("./graphics/vertex.zig").Vertex;
+const GraphicsContext = @import("graphics_context").GraphicsContext;
+const Swapchain = @import("swapchain").Swapchain;
+const Vertex = @import("vertex").Vertex;
+const FrameTimer = @import("frame_time").FrameTimer;
 
 const triangle_vert = @embedFile("triangle_vert");
 const triangle_frag = @embedFile("triangle_frag");

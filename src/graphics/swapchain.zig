@@ -1,6 +1,7 @@
 const std = @import("std");
 const vk = @import("vulkan");
-const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
+const GraphicsContext = @import("graphics_context").GraphicsContext;
+const Vertex = @import("vertex").Vertex;
 const Allocator = std.mem.Allocator;
 
 pub const Swapchain = struct {
