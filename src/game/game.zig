@@ -1,7 +1,7 @@
 const std = @import("std");
 
-/// Engine-agnostic input snapshot for a single frame.
-/// Main maps GLFW state into this.
+/// High-level input state, decoupled from GLFW.
+/// main.zig is responsible for mapping key presses to this struct.
 pub const InputState = struct {
     move_forward: bool = false,
     move_backward: bool = false,
@@ -10,29 +10,77 @@ pub const InputState = struct {
     quit: bool = false,
 };
 
-/// Minimal "game core" for the demo.
-/// Right now: a single player with a 2D position and constant move speed.
-/// Later: hero state, abilities, cooldowns, projectiles, etc.
+/// Core game state:
+/// - A player-controlled hero (WASD)
+/// - An orbiting enemy
+/// - Simple collision + score
 pub const Game = struct {
-    /// Arbitrary units; interpreted by renderer however it wants.
+    /// Hero position in a simple 2D "world" space.
     player_x: f32 = 0.0,
     player_y: f32 = 0.0,
 
-    /// Units per second.
-    move_speed: f32 = 3.5,
+    /// Enemy position + internal orbit phase.
+    enemy_x: f32 = 0.6,
+    enemy_y: f32 = 0.0,
+    enemy_angle: f32 = 0.0,
+
+    /// Number of times the hero has "tagged" the enemy.
+    score: u32 = 0,
+
+    /// Used to detect rising edge of collisions so we don't
+    /// increment score every frame while overlapping.
+    _was_colliding: bool = false,
+
+    const move_speed: f32 = 3.5;
+    const enemy_radius: f32 = 0.75;
+    const collision_radius: f32 = 0.25;
+    const tau: f32 = 6.28318530717958647692;
 
     pub fn init() Game {
         return .{};
     }
 
-    /// Advance game state by `dt` seconds under the given input.
+    /// Advance the game by dt seconds with a given input snapshot.
     pub fn update(self: *Game, dt: f32, input: InputState) void {
-        const s = self.move_speed;
+        // ── Hero movement (WASD) ─────────────────────────────────────────
+        if (input.move_forward) self.player_y -= move_speed * dt;
+        if (input.move_backward) self.player_y += move_speed * dt;
+        if (input.move_left) self.player_x -= move_speed * dt;
+        if (input.move_right) self.player_x += move_speed * dt;
 
-        if (input.move_forward) self.player_y += s * dt;
-        if (input.move_backward) self.player_y -= s * dt;
-        if (input.move_left) self.player_x -= s * dt;
-        if (input.move_right) self.player_x += s * dt;
+        // ── Enemy orbit ──────────────────────────────────────────────────
+        self.enemy_angle += 0.7 * dt;
+        if (self.enemy_angle > tau) {
+            self.enemy_angle -= tau;
+        }
+
+        const math = std.math;
+        self.enemy_x = math.cos(self.enemy_angle) * enemy_radius;
+        self.enemy_y = math.sin(self.enemy_angle) * enemy_radius;
+
+        // ── Collision + score (edge-triggered) ───────────────────────────
+        const hit_now = self.isColliding();
+        if (hit_now and !self._was_colliding) {
+            self.score += 1;
+        }
+        self._was_colliding = hit_now;
+    }
+
+    /// Hero ↔ enemy proximity in "world" space.
+    pub fn isColliding(self: *const Game) bool {
+        const dx = self.player_x - self.enemy_x;
+        const dy = self.player_y - self.enemy_y;
+        const dist2 = dx * dx + dy * dy;
+        const radius2 = collision_radius * collision_radius;
+        return dist2 <= radius2;
+    }
+
+    pub fn heroPosition(self: *const Game) [2]f32 {
+        return .{ self.player_x, self.player_y };
+    }
+
+    pub fn enemyPosition(self: *const Game) [2]f32 {
+        return .{ self.enemy_x, self.enemy_y };
     }
 };
 
@@ -41,27 +89,55 @@ pub const Game = struct {
 // ─────────────────────────────────────────────────────────────────────────────
 
 test "Game basic movement with WASD-style input" {
-    var g = Game.init();
+    var game = Game.init();
 
     // No movement when no input.
-    g.update(1.0, .{});
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), g.player_x, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), g.player_y, 0.0001);
+    game.update(1.0, .{});
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), game.player_x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), game.player_y, 0.0001);
 
     // Move forward for 1 second.
-    g.update(1.0, .{ .move_forward = true });
-    try std.testing.expect(g.player_y > 0.0);
-    const y_after_forward = g.player_y;
+    game.update(1.0, .{ .move_forward = true });
+    try std.testing.expect(game.player_y > 0.0);
+    const y_after_forward = game.player_y;
 
     // Move backward for 0.5 seconds; should reduce y a bit.
-    g.update(0.5, .{ .move_backward = true });
-    try std.testing.expect(g.player_y < y_after_forward);
+    game.update(0.5, .{ .move_backward = true });
+    try std.testing.expect(game.player_y < y_after_forward);
 
     // Move right for 2 seconds; x should increase.
-    g.update(2.0, .{ .move_right = true });
-    try std.testing.expect(g.player_x > 0.0);
+    game.update(2.0, .{ .move_right = true });
+    try std.testing.expect(game.player_x > 0.0);
 }
 
-test "refAllDecls(game)" {
+test "Game collision detection + edge-triggered score" {
+    var game = Game.init();
+
+    // Place hero at origin.
+    game.player_x = 0.0;
+    game.player_y = 0.0;
+
+    // Far away enemy → no collision.
+    game.enemy_x = 1.0;
+    game.enemy_y = 0.0;
+    try std.testing.expect(!game.isColliding());
+
+    // Bring enemy close enough to collide.
+    game.enemy_x = 0.1;
+    game.enemy_y = 0.0;
+    try std.testing.expect(game.isColliding());
+
+    const before_score = game.score;
+
+    // First update with collision should increment score once.
+    game.update(0.0, .{});
+    try std.testing.expect(game.score == before_score + 1);
+
+    // Subsequent updates while still colliding should not spam score.
+    game.update(0.0, .{});
+    try std.testing.expect(game.score == before_score + 1);
+}
+
+test "refAllDecls" {
     std.testing.refAllDecls(@This());
 }

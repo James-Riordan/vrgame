@@ -10,13 +10,13 @@ const frame_time = @import("frame_time");
 const FrameTimer = frame_time.FrameTimer;
 
 const game = @import("game");
+const InputState = game.InputState;
+const Game = game.Game;
 
 const triangle_vert = @embedFile("triangle_vert");
 const triangle_frag = @embedFile("triangle_frag");
 
 const Allocator = std.mem.Allocator;
-const InputState = game.InputState;
-const Game = game.Game;
 
 const VK_FALSE32: vk.Bool32 = @enumFromInt(vk.FALSE);
 const VK_TRUE32: vk.Bool32 = @enumFromInt(vk.TRUE);
@@ -27,14 +27,14 @@ const app_name = "VRGame — Zigadel Prototype";
 // NUL-terminated window title for GLFW.
 const window_title: [:0]const u8 = "VRGame — Zigadel Prototype";
 
-fn updateWindowTitle(window: *glfw.Window, fps: f64, g: Game) void {
+fn updateWindowTitle(window: *glfw.Window, fps: f64, g: *const Game) void {
     // Small fixed buffer for the title; avoid heap allocation.
-    var buf: [128]u8 = undefined;
+    var buf: [160]u8 = undefined;
 
     const title = std.fmt.bufPrintZ(
         &buf,
-        "VRGame — Zigadel Prototype | FPS: {d:.1} | x: {d:.2}, y: {d:.2}",
-        .{ fps, g.player_x, g.player_y },
+        "VRGame — Zigadel Prototype | FPS: {d:.1} | x: {d:.2}, y: {d:.2} | Score: {d}",
+        .{ fps, g.player_x, g.player_y, g.score },
     ) catch {
         // Fallback to the static title if formatting fails for any reason.
         glfw.setWindowTitle(window, window_title);
@@ -175,7 +175,7 @@ pub fn main() !void {
     defer gc.vkd.freeMemory(gc.dev, memory, null);
     try gc.vkd.bindBufferMemory(gc.dev, buffer, memory, 0);
 
-    // Persistent staging buffer (host-visible) used to update the triangle each frame.
+    // Persistent staging buffer (host-visible) used to update the vertices each frame.
     const staging_buffer = try gc.vkd.createBuffer(gc.dev, &.{
         .flags = .{},
         .size = @sizeOf(@TypeOf(vertices)),
@@ -218,8 +218,8 @@ pub fn main() !void {
         const dt = @as(f32, @floatCast(tick.dt));
 
         if (tick.fps_updated) {
-            std.log.info("FPS: {d:.2}", .{tick.fps});
-            updateWindowTitle(window, tick.fps, game_state);
+            std.log.info("FPS: {d:.2} | Score: {d}", .{ tick.fps, game_state.score });
+            updateWindowTitle(window, tick.fps, &game_state);
         }
 
         const input = sampleInput(window);
@@ -230,7 +230,8 @@ pub fn main() !void {
 
         game_state.update(dt, input);
 
-        try updateTriangleVertices(&gc, staging_memory, game_state);
+        // Update hero + enemy triangles from game state and upload via staging.
+        try updateTriangleVertices(&gc, staging_memory, &game_state);
         try copyBuffer(&gc, pool, buffer, staging_buffer, @sizeOf(@TypeOf(vertices)));
 
         const cmdbuf = cmdbufs[swapchain.image_index];
@@ -315,39 +316,75 @@ fn sampleInput(window: *glfw.Window) InputState {
 // Geometry / vertices
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Simple demo triangle.
+// Two triangles: hero (0..2) and enemy (3..5).
 const vertices = [_]Vertex{
-    .{ .pos = .{ 0, -0.5 }, .color = .{ 1, 0, 0 } },
-    .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0, 1, 0 } },
-    .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0, 0, 1 } },
+    // Hero triangle (small, centered)
+    .{ .pos = .{ 0.0, -0.15 }, .color = .{ 0.2, 0.8, 1.0 } },
+    .{ .pos = .{ 0.15, 0.15 }, .color = .{ 0.2, 0.8, 1.0 } },
+    .{ .pos = .{ -0.15, 0.15 }, .color = .{ 0.2, 0.8, 1.0 } },
+
+    // Enemy triangle (similar shape; offset in world space)
+    .{ .pos = .{ 0.0, -0.10 }, .color = .{ 1.0, 0.3, 0.3 } },
+    .{ .pos = .{ 0.10, 0.10 }, .color = .{ 1.0, 0.3, 0.3 } },
+    .{ .pos = .{ -0.10, 0.10 }, .color = .{ 1.0, 0.3, 0.3 } },
 };
 
 fn updateTriangleVertices(
     gc: *const GraphicsContext,
     staging_memory: vk.DeviceMemory,
-    g: Game,
+    g: *const Game,
 ) !void {
     const data = try gc.vkd.mapMemory(gc.dev, staging_memory, 0, vk.WHOLE_SIZE, .{});
     defer gc.vkd.unmapMemory(gc.dev, staging_memory);
 
     const gpu_vertices: [*]Vertex = @ptrCast(@alignCast(data));
 
-    // Scale world-space moves to NDC so the triangle doesn't fly off-screen.
-    const scale: f32 = 0.2;
+    const hero = g.heroPosition();
+    const enemy = g.enemyPosition();
 
-    for (vertices, 0..) |v, i| {
-        gpu_vertices[i] = .{
-            .pos = .{
-                v.pos[0] + g.player_x * scale,
-                v.pos[1] + g.player_y * scale,
-            },
-            .color = v.color,
-        };
+    // Scale world-space movement into NDC so the triangles stay visible.
+    const hero_scale: f32 = 0.2;
+    const enemy_scale: f32 = 0.2;
+
+    // ── Hero vertices (0..2) ─────────────────────────────────────────────
+    {
+        var i: usize = 0;
+        while (i < 3) : (i += 1) {
+            const base = vertices[i];
+            gpu_vertices[i] = .{
+                .pos = .{
+                    base.pos[0] + hero[0] * hero_scale,
+                    base.pos[1] + hero[1] * hero_scale,
+                },
+                .color = base.color, // hero stays cyan-ish
+            };
+        }
+    }
+
+    // ── Enemy vertices (3..5) ────────────────────────────────────────────
+    const enemy_hit = g.isColliding();
+    const enemy_color: [3]f32 = if (enemy_hit)
+        .{ 0.2, 1.0, 0.3 } // green when tagged
+    else
+        .{ 1.0, 0.3, 0.3 }; // red otherwise
+
+    {
+        var i: usize = 3;
+        while (i < 6) : (i += 1) {
+            const base = vertices[i];
+            gpu_vertices[i] = .{
+                .pos = .{
+                    base.pos[0] + enemy[0] * enemy_scale,
+                    base.pos[1] + enemy[1] * enemy_scale,
+                },
+                .color = enemy_color,
+            };
+        }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Upload vertices
+// Upload vertices (one-shot helper, currently unused but kept for reference)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn uploadVertices(gc: *const GraphicsContext, pool: vk.CommandPool, buffer: vk.Buffer) !void {
