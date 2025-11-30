@@ -13,9 +13,6 @@ const game = @import("game");
 const InputState = game.InputState;
 const Game = game.Game;
 
-const camera_mod = @import("camera");
-const Camera2D = camera_mod.Camera2D;
-
 const triangle_vert = @embedFile("triangle_vert");
 const triangle_frag = @embedFile("triangle_frag");
 
@@ -35,15 +32,15 @@ const window_title: [:0]const u8 = "VRGame — Zigadel Prototype";
 // ─────────────────────────────────────────────────────────────────────────────
 
 const hero_template = [_]Vertex{
-    .{ .pos = .{ 0.0, 0.20 }, .color = .{ 0.9, 0.9, 0.9 } }, // tip
-    .{ .pos = .{ -0.12, -0.12 }, .color = .{ 0.2, 0.8, 1.0 } },
-    .{ .pos = .{ 0.12, -0.12 }, .color = .{ 0.2, 0.8, 1.0 } },
+    .{ .pos = .{ 0.0, 0.20, 0.0 }, .color = .{ 0.9, 0.9, 0.9 } }, // tip
+    .{ .pos = .{ -0.12, -0.12, 0.0 }, .color = .{ 0.2, 0.8, 1.0 } },
+    .{ .pos = .{ 0.12, -0.12, 0.0 }, .color = .{ 0.2, 0.8, 1.0 } },
 };
 
 const enemy_template = [_]Vertex{
-    .{ .pos = .{ 0.0, 0.22 }, .color = .{ 1.0, 0.3, 0.3 } },
-    .{ .pos = .{ -0.14, -0.14 }, .color = .{ 0.8, 0.2, 0.2 } },
-    .{ .pos = .{ 0.14, -0.14 }, .color = .{ 0.8, 0.2, 0.2 } },
+    .{ .pos = .{ 0.0, 0.22, 0.0 }, .color = .{ 1.0, 0.3, 0.3 } },
+    .{ .pos = .{ -0.14, -0.14, 0.0 }, .color = .{ 0.8, 0.2, 0.2 } },
+    .{ .pos = .{ 0.14, -0.14, 0.0 }, .color = .{ 0.8, 0.2, 0.2 } },
 };
 
 const TOTAL_VERTICES: u32 = hero_template.len + enemy_template.len;
@@ -75,6 +72,19 @@ fn updateWindowTitle(window: *glfw.Window, fps: f64, g: *const Game) void {
 fn nowMsFromGlfw() i64 {
     const now_s: f64 = glfw.getTime();
     return @as(i64, @intFromFloat(now_s * 1000.0));
+}
+
+/// Simple orthographic-style mapping from "world" space to NDC.
+/// This keeps everything roughly on-screen without needing a full camera yet.
+fn worldToNdc(world: [3]f32) [3]f32 {
+    const half_width: f32 = 3.0;
+    const half_height: f32 = 3.0;
+
+    return .{
+        world[0] / half_width,
+        world[1] / half_height,
+        world[2],
+    };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -235,22 +245,15 @@ pub fn main() !void {
     defer destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
 
     // ─────────────────────────────────────────────────────────────────────
-    // Game state + camera + frame timer
+    // Game state + frame timer
     // ─────────────────────────────────────────────────────────────────────
 
     var game_state = Game.init();
-
-    // Camera view box matches the world bounds used in game.zig
-    // (world_half_width/world_half_height).
-    var camera = Camera2D.init(0.0, 0.0, 2.5, 1.5);
-
     var frame_timer = FrameTimer.init(nowMsFromGlfw(), 1000); // 1s FPS window.
 
     // Prime the vertex buffer once so we don't start with garbage.
     {
-        const hero_pos = game_state.heroPosition();
-        camera.setCenter(hero_pos[0], hero_pos[1]);
-        try updateWorldVertices(&gc, staging_memory, &game_state, &camera);
+        try updateWorldVertices(&gc, staging_memory, &game_state);
         try copyBuffer(&gc, pool, buffer, staging_buffer, VERTEX_BUFFER_SIZE);
     }
 
@@ -274,12 +277,8 @@ pub fn main() !void {
 
         game_state.update(dt, input);
 
-        // Camera follows hero (third-person style; later, we can loosen this).
-        const hero_pos = game_state.heroPosition();
-        camera.setCenter(hero_pos[0], hero_pos[1]);
-
         // Rebuild world → NDC vertices into staging, then copy to device-local buffer.
-        try updateWorldVertices(&gc, staging_memory, &game_state, &camera);
+        try updateWorldVertices(&gc, staging_memory, &game_state);
         try copyBuffer(&gc, pool, buffer, staging_buffer, VERTEX_BUFFER_SIZE);
 
         const cmdbuf = cmdbufs[swapchain.image_index];
@@ -291,9 +290,9 @@ pub fn main() !void {
 
         if (state == .suboptimal) {
             const size = glfw.getWindowSize(window);
+
+            // Handle minimized / zero-size window safely.
             if (size.width == 0 or size.height == 0) {
-                // On macOS this can happen during live resize / minimize.
-                // Just skip recreating until we have a real framebuffer size.
                 glfw.pollEvents();
                 continue;
             }
@@ -361,30 +360,33 @@ fn sampleInput(window: *glfw.Window) InputState {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Geometry update: Game + Camera → Vertex buffer
+// Geometry update: Game → Vertex buffer
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn updateWorldVertices(
     gc: *const GraphicsContext,
     staging_memory: vk.DeviceMemory,
     g: *const Game,
-    camera: *const Camera2D,
 ) !void {
     const data = try gc.vkd.mapMemory(gc.dev, staging_memory, 0, vk.WHOLE_SIZE, .{});
     defer gc.vkd.unmapMemory(gc.dev, staging_memory);
 
     const gpu_vertices: [*]Vertex = @ptrCast(@alignCast(data));
 
-    const hero_world = g.heroPosition();
-    const enemy_world = g.enemyPosition();
+    const hero_xy = g.heroPosition();
+    const enemy_xy = g.enemyPosition();
+
+    const hero_world = [3]f32{ hero_xy[0], hero_xy[1], 0.0 };
+    const enemy_world = [3]f32{ enemy_xy[0], enemy_xy[1], 0.0 };
 
     // Hero (no flash)
     for (hero_template, 0..) |v, i| {
-        const world_pos = [2]f32{
+        const world_pos = [3]f32{
             hero_world[0] + v.pos[0],
             hero_world[1] + v.pos[1],
+            hero_world[2] + v.pos[2],
         };
-        const ndc = camera.worldToNdc(world_pos);
+        const ndc = worldToNdc(world_pos);
 
         gpu_vertices[i] = .{
             .pos = ndc,
@@ -401,11 +403,12 @@ fn updateWorldVertices(
     for (enemy_template, 0..) |v, j| {
         const idx = base + j;
 
-        const world_pos = [2]f32{
+        const world_pos = [3]f32{
             enemy_world[0] + v.pos[0],
             enemy_world[1] + v.pos[1],
+            enemy_world[2] + v.pos[2],
         };
-        const ndc = camera.worldToNdc(world_pos);
+        const ndc = worldToNdc(world_pos);
 
         const c = v.color;
         gpu_vertices[idx] = .{

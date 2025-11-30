@@ -1,8 +1,8 @@
 const vk = @import("vulkan");
 
 pub const Vertex = struct {
-    pos: [2]f32,
-    color: [3]f32,
+    pos: [3]f32, // x, y, z
+    color: [3]f32, // rgb
 
     pub const binding_description = vk.VertexInputBindingDescription{
         .binding = 0,
