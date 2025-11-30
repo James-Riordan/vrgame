@@ -13,6 +13,14 @@ const game = @import("game");
 const InputState = game.InputState;
 const Game = game.Game;
 
+const camera3d = @import("camera3d");
+const Camera3D = camera3d.Camera3D;
+const CameraInput = camera3d.CameraInput;
+
+const math3d = @import("math3d");
+const Vec3 = math3d.Vec3;
+const Mat4 = math3d.Mat4;
+
 const triangle_vert = @embedFile("triangle_vert");
 const triangle_frag = @embedFile("triangle_frag");
 
@@ -28,7 +36,7 @@ const app_name = "VRGame — Zigadel Prototype";
 const window_title: [:0]const u8 = "VRGame — Zigadel Prototype";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Hero / enemy geometry templates (local offsets in world units)
+// Hero / enemy geometry templates (local offsets in world units, in XY plane)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const hero_template = [_]Vertex{
@@ -51,6 +59,11 @@ const VERTEX_BUFFER_SIZE: vk.DeviceSize =
 // Utility
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn degToRad(deg: f32) f32 {
+    const pi_f32: f32 = @floatCast(std.math.pi);
+    return deg * (pi_f32 / 180.0);
+}
+
 fn updateWindowTitle(window: *glfw.Window, fps: f64, g: *const Game) void {
     // Small fixed buffer for the title; avoid heap allocation.
     var buf: [160]u8 = undefined;
@@ -72,19 +85,6 @@ fn updateWindowTitle(window: *glfw.Window, fps: f64, g: *const Game) void {
 fn nowMsFromGlfw() i64 {
     const now_s: f64 = glfw.getTime();
     return @as(i64, @intFromFloat(now_s * 1000.0));
-}
-
-/// Simple orthographic-style mapping from "world" space to NDC.
-/// This keeps everything roughly on-screen without needing a full camera yet.
-fn worldToNdc(world: [3]f32) [3]f32 {
-    const half_width: f32 = 3.0;
-    const half_height: f32 = 3.0;
-
-    return .{
-        world[0] / half_width,
-        world[1] / half_height,
-        world[2],
-    };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,10 +170,97 @@ pub fn main() !void {
     var swapchain = try Swapchain.init(&gc, allocator, extent);
     defer swapchain.deinit();
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Camera UBO + descriptor set
+    // ─────────────────────────────────────────────────────────────────────
+
+    const camera_ubo_size: vk.DeviceSize = @intCast(@sizeOf(Mat4));
+
+    // One uniform buffer for the camera view-projection matrix.
+    const camera_buffer = try gc.vkd.createBuffer(gc.dev, &.{
+        .flags = .{},
+        .size = camera_ubo_size,
+        .usage = .{ .uniform_buffer_bit = true },
+        .sharing_mode = .exclusive,
+        .queue_family_index_count = 0,
+        .p_queue_family_indices = undefined,
+    }, null);
+    defer gc.vkd.destroyBuffer(gc.dev, camera_buffer, null);
+
+    const camera_mem_reqs = gc.vkd.getBufferMemoryRequirements(gc.dev, camera_buffer);
+    const camera_memory = try gc.allocate(camera_mem_reqs, .{
+        .host_visible_bit = true,
+        .host_coherent_bit = true,
+    });
+    defer gc.vkd.freeMemory(gc.dev, camera_memory, null);
+    try gc.vkd.bindBufferMemory(gc.dev, camera_buffer, camera_memory, 0);
+
+    const camera_binding = vk.DescriptorSetLayoutBinding{
+        .binding = 0,
+        .descriptor_type = .uniform_buffer,
+        .descriptor_count = 1,
+        .stage_flags = .{ .vertex_bit = true },
+        .p_immutable_samplers = null,
+    };
+
+    const camera_set_layout = try gc.vkd.createDescriptorSetLayout(gc.dev, &vk.DescriptorSetLayoutCreateInfo{
+        .flags = .{},
+        .binding_count = 1,
+        .p_bindings = @ptrCast(&camera_binding),
+    }, null);
+    defer gc.vkd.destroyDescriptorSetLayout(gc.dev, camera_set_layout, null);
+
+    const pool_size = vk.DescriptorPoolSize{
+        .type = .uniform_buffer,
+        .descriptor_count = 1,
+    };
+
+    const camera_descriptor_pool = try gc.vkd.createDescriptorPool(gc.dev, &vk.DescriptorPoolCreateInfo{
+        .flags = .{},
+        .max_sets = 1,
+        .pool_size_count = 1,
+        .p_pool_sizes = @ptrCast(&pool_size),
+    }, null);
+    defer gc.vkd.destroyDescriptorPool(gc.dev, camera_descriptor_pool, null);
+
+    var camera_descriptor_set: vk.DescriptorSet = undefined;
+    {
+        const set_layouts = [_]vk.DescriptorSetLayout{camera_set_layout};
+        try gc.vkd.allocateDescriptorSets(gc.dev, &vk.DescriptorSetAllocateInfo{
+            .descriptor_pool = camera_descriptor_pool,
+            .descriptor_set_count = 1,
+            .p_set_layouts = &set_layouts,
+        }, @ptrCast(&camera_descriptor_set));
+    }
+
+    const camera_buffer_info = vk.DescriptorBufferInfo{
+        .buffer = camera_buffer,
+        .offset = 0,
+        .range = camera_ubo_size,
+    };
+
+    const write = vk.WriteDescriptorSet{
+        .dst_set = camera_descriptor_set,
+        .dst_binding = 0,
+        .dst_array_element = 0,
+        .descriptor_count = 1,
+        .descriptor_type = .uniform_buffer,
+        .p_image_info = undefined,
+        .p_buffer_info = @ptrCast(&camera_buffer_info),
+        .p_texel_buffer_view = undefined,
+    };
+
+    gc.vkd.updateDescriptorSets(gc.dev, 1, @ptrCast(&write), 0, undefined);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Pipeline layout / render pass / pipeline
+    // ─────────────────────────────────────────────────────────────────────
+
+    const set_layouts_for_pipeline = [_]vk.DescriptorSetLayout{camera_set_layout};
     const pipeline_layout = try gc.vkd.createPipelineLayout(gc.dev, &.{
         .flags = .{},
-        .set_layout_count = 0,
-        .p_set_layouts = undefined,
+        .set_layout_count = set_layouts_for_pipeline.len,
+        .p_set_layouts = &set_layouts_for_pipeline,
         .push_constant_range_count = 0,
         .p_push_constant_ranges = undefined,
     }, null);
@@ -239,22 +326,40 @@ pub fn main() !void {
         buffer,
         swapchain.extent,
         render_pass,
+        pipeline_layout,
         pipeline,
         framebuffers,
+        camera_descriptor_set,
     );
     defer destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
 
     // ─────────────────────────────────────────────────────────────────────
-    // Game state + frame timer
+    // Game state + camera + frame timer
     // ─────────────────────────────────────────────────────────────────────
 
     var game_state = Game.init();
+
+    const aspect: f32 =
+        @as(f32, @floatFromInt(swapchain.extent.width)) /
+        @as(f32, @floatFromInt(swapchain.extent.height));
+
+    var camera = Camera3D.init(
+        Vec3.init(0.0, 0.0, 5.0),
+        degToRad(60.0),
+        aspect,
+        0.1,
+        100.0,
+    );
+
     var frame_timer = FrameTimer.init(nowMsFromGlfw(), 1000); // 1s FPS window.
 
     // Prime the vertex buffer once so we don't start with garbage.
     {
         try updateWorldVertices(&gc, staging_memory, &game_state);
         try copyBuffer(&gc, pool, buffer, staging_buffer, VERTEX_BUFFER_SIZE);
+
+        const view_proj = camera.viewProjMatrix();
+        try updateCameraUniform(&gc, camera_memory, view_proj);
     }
 
     while (!glfw.windowShouldClose(window)) {
@@ -275,9 +380,18 @@ pub fn main() !void {
             break;
         }
 
+        // Hero / enemy sim
         game_state.update(dt, input);
 
-        // Rebuild world → NDC vertices into staging, then copy to device-local buffer.
+        // Camera input + update
+        const cam_input = sampleCameraInput(window);
+        camera.update(dt, cam_input);
+
+        // Upload camera view-projection matrix to UBO.
+        const view_proj = camera.viewProjMatrix();
+        try updateCameraUniform(&gc, camera_memory, view_proj);
+
+        // Rebuild world → world-space vertices into staging, then copy to device-local buffer.
         try updateWorldVertices(&gc, staging_memory, &game_state);
         try copyBuffer(&gc, pool, buffer, staging_buffer, VERTEX_BUFFER_SIZE);
 
@@ -302,6 +416,11 @@ pub fn main() !void {
 
             try swapchain.recreate(extent);
 
+            const new_aspect: f32 =
+                @as(f32, @floatFromInt(extent.width)) /
+                @as(f32, @floatFromInt(extent.height));
+            camera.setAspect(new_aspect);
+
             destroyFramebuffers(&gc, allocator, framebuffers);
             framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain);
 
@@ -313,8 +432,10 @@ pub fn main() !void {
                 buffer,
                 swapchain.extent,
                 render_pass,
+                pipeline_layout,
                 pipeline,
                 framebuffers,
+                camera_descriptor_set,
             );
         }
 
@@ -325,7 +446,7 @@ pub fn main() !void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Input sampling
+// Input sampling (hero)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn sampleInput(window: *glfw.Window) InputState {
@@ -360,7 +481,89 @@ fn sampleInput(window: *glfw.Window) InputState {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Geometry update: Game → Vertex buffer
+// Input sampling (camera)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn sampleCameraInput(window: *glfw.Window) CameraInput {
+    var ci: CameraInput = .{};
+
+    // Right mouse button drag → look around.
+    const rmb = glfw.getMouseButton(window, glfw.c.GLFW_MOUSE_BUTTON_RIGHT);
+    const cursor = glfw.getCursorPos(window);
+    const x = cursor.x;
+    const y = cursor.y;
+
+    const State = struct {
+        var last_x: f64 = 0;
+        var last_y: f64 = 0;
+        var initialized: bool = false;
+        var last_rmb_down: bool = false;
+    };
+
+    if (rmb == glfw.c.GLFW_PRESS) {
+        if (!State.initialized or !State.last_rmb_down) {
+            State.last_x = x;
+            State.last_y = y;
+            State.initialized = true;
+        } else {
+            const dx = x - State.last_x;
+            const dy = y - State.last_y;
+
+            // Raw deltas; Camera3D.update will scale by sensitivity.
+            ci.look_delta_x = @as(f32, @floatCast(dx));
+            ci.look_delta_y = @as(f32, @floatCast(dy));
+
+            State.last_x = x;
+            State.last_y = y;
+        }
+    }
+    State.last_rmb_down = (rmb == glfw.c.GLFW_PRESS);
+
+    // Camera translation: arrow keys + Q/E for up/down.
+    const up_state = glfw.getKey(window, glfw.c.GLFW_KEY_UP);
+    const down_state = glfw.getKey(window, glfw.c.GLFW_KEY_DOWN);
+    const left_state = glfw.getKey(window, glfw.c.GLFW_KEY_LEFT);
+    const right_state = glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT);
+    const q_state = glfw.getKey(window, glfw.c.GLFW_KEY_Q);
+    const e_state = glfw.getKey(window, glfw.c.GLFW_KEY_E);
+
+    if (up_state == glfw.c.GLFW_PRESS or up_state == glfw.c.GLFW_REPEAT)
+        ci.move_forward = true;
+    if (down_state == glfw.c.GLFW_PRESS or down_state == glfw.c.GLFW_REPEAT)
+        ci.move_backward = true;
+    if (left_state == glfw.c.GLFW_PRESS or left_state == glfw.c.GLFW_REPEAT)
+        ci.move_left = true;
+    if (right_state == glfw.c.GLFW_PRESS or right_state == glfw.c.GLFW_REPEAT)
+        ci.move_right = true;
+    if (q_state == glfw.c.GLFW_PRESS or q_state == glfw.c.GLFW_REPEAT)
+        ci.move_down = true;
+    if (e_state == glfw.c.GLFW_PRESS or e_state == glfw.c.GLFW_REPEAT)
+        ci.move_up = true;
+
+    return ci;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Camera UBO update
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn updateCameraUniform(
+    gc: *const GraphicsContext,
+    memory: vk.DeviceMemory,
+    view_proj: Mat4,
+) !void {
+    const data_ptr = try gc.vkd.mapMemory(gc.dev, memory, 0, vk.WHOLE_SIZE, .{});
+    defer gc.vkd.unmapMemory(gc.dev, memory);
+
+    const dst_bytes: [*]u8 = @ptrCast(@alignCast(data_ptr));
+    const dst_slice = dst_bytes[0..@sizeOf(Mat4)];
+    const src_slice = std.mem.asBytes(&view_proj);
+
+    @memcpy(dst_slice, src_slice);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Geometry update: Game → world-space vertex buffer
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn updateWorldVertices(
@@ -386,10 +589,9 @@ fn updateWorldVertices(
             hero_world[1] + v.pos[1],
             hero_world[2] + v.pos[2],
         };
-        const ndc = worldToNdc(world_pos);
 
         gpu_vertices[i] = .{
-            .pos = ndc,
+            .pos = world_pos,
             .color = v.color,
         };
     }
@@ -408,11 +610,10 @@ fn updateWorldVertices(
             enemy_world[1] + v.pos[1],
             enemy_world[2] + v.pos[2],
         };
-        const ndc = worldToNdc(world_pos);
 
         const c = v.color;
         gpu_vertices[idx] = .{
-            .pos = ndc,
+            .pos = world_pos,
             .color = .{
                 c[0] * inv_flash + flash_color[0] * flash,
                 c[1] * inv_flash + flash_color[1] * flash,
@@ -480,8 +681,10 @@ fn createCommandBuffers(
     buffer: vk.Buffer,
     extent: vk.Extent2D,
     render_pass: vk.RenderPass,
+    pipeline_layout: vk.PipelineLayout,
     pipeline: vk.Pipeline,
     framebuffers: []vk.Framebuffer,
+    descriptor_set: vk.DescriptorSet,
 ) ![]vk.CommandBuffer {
     const cmdbufs = try allocator.alloc(vk.CommandBuffer, framebuffers.len);
     errdefer allocator.free(cmdbufs);
@@ -544,6 +747,18 @@ fn createCommandBuffers(
         }, .@"inline");
 
         gc.vkd.cmdBindPipeline(cmdbuf, .graphics, pipeline);
+
+        // Bind camera descriptor set (view-projection UBO).
+        gc.vkd.cmdBindDescriptorSets(
+            cmdbuf,
+            .graphics,
+            pipeline_layout,
+            0,
+            1,
+            @ptrCast(&descriptor_set),
+            0,
+            undefined,
+        );
 
         const offset = [_]vk.DeviceSize{0};
         gc.vkd.cmdBindVertexBuffers(

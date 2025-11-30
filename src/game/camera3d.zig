@@ -1,7 +1,8 @@
 const std = @import("std");
 const math3d = @import("math3d");
 
-const Vec3 = math3d.Vec3;
+// Make Vec3 visible to other modules (e.g. main.zig).
+pub const Vec3 = math3d.Vec3;
 const Mat4 = math3d.Mat4;
 
 fn degToRad(deg: f32) f32 {
@@ -106,7 +107,7 @@ pub const Camera3D = struct {
     }
 
     /// Apply one frame of input.
-    /// `dt` in seconds. `input.look_delta_*` can be raw or pre-scaled; we multiply by sensitivity * dt.
+    /// `dt` in seconds. `input.look_delta_*` can be raw or pre-scaled; we multiply by sensitivity.
     pub fn update(self: *Camera3D, dt: f32, input: CameraInput) void {
         // Mouse look: yaw around world up, pitch around local right.
         const look_scale = self.look_sensitivity;
