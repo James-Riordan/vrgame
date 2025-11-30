@@ -13,7 +13,7 @@ pub const InputState = struct {
 /// Core game state:
 /// - A player-controlled hero (WASD)
 /// - An orbiting enemy
-/// - Simple collision + score
+/// - Simple collision + score + hit-flash
 pub const Game = struct {
     /// Hero position in a simple 2D "world" space.
     player_x: f32 = 0.0,
@@ -31,10 +31,20 @@ pub const Game = struct {
     /// increment score every frame while overlapping.
     _was_colliding: bool = false,
 
+    /// Time remaining for the hit-flash effect (seconds).
+    hit_flash_timer: f32 = 0.0,
+
     const move_speed: f32 = 3.5;
     const enemy_radius: f32 = 0.75;
     const collision_radius: f32 = 0.25;
     const tau: f32 = 6.28318530717958647692;
+
+    /// Simple "world bounds" so the hero can't leave forever.
+    const world_half_width: f32 = 2.0;
+    const world_half_height: f32 = 1.5;
+
+    /// Duration of the hit-flash in seconds.
+    const hit_flash_duration: f32 = 0.25;
 
     pub fn init() Game {
         return .{};
@@ -43,10 +53,16 @@ pub const Game = struct {
     /// Advance the game by dt seconds with a given input snapshot.
     pub fn update(self: *Game, dt: f32, input: InputState) void {
         // ── Hero movement (WASD) ─────────────────────────────────────────
-        if (input.move_forward) self.player_y -= move_speed * dt;
-        if (input.move_backward) self.player_y += move_speed * dt;
+        if (input.move_forward) self.player_y += move_speed * dt;
+        if (input.move_backward) self.player_y -= move_speed * dt;
         if (input.move_left) self.player_x -= move_speed * dt;
         if (input.move_right) self.player_x += move_speed * dt;
+
+        // Clamp hero to a simple axis-aligned world box.
+        if (self.player_x > world_half_width) self.player_x = world_half_width;
+        if (self.player_x < -world_half_width) self.player_x = -world_half_width;
+        if (self.player_y > world_half_height) self.player_y = world_half_height;
+        if (self.player_y < -world_half_height) self.player_y = -world_half_height;
 
         // ── Enemy orbit ──────────────────────────────────────────────────
         self.enemy_angle += 0.7 * dt;
@@ -62,8 +78,15 @@ pub const Game = struct {
         const hit_now = self.isColliding();
         if (hit_now and !self._was_colliding) {
             self.score += 1;
+            self.hit_flash_timer = hit_flash_duration;
         }
         self._was_colliding = hit_now;
+
+        // ── Hit-flash timer decay ────────────────────────────────────────
+        if (self.hit_flash_timer > 0.0) {
+            self.hit_flash_timer -= dt;
+            if (self.hit_flash_timer < 0.0) self.hit_flash_timer = 0.0;
+        }
     }
 
     /// Hero ↔ enemy proximity in "world" space.
@@ -73,6 +96,12 @@ pub const Game = struct {
         const dist2 = dx * dx + dy * dy;
         const radius2 = collision_radius * collision_radius;
         return dist2 <= radius2;
+    }
+
+    /// Returns a 0–1 hit-flash intensity based on remaining flash time.
+    pub fn hitFlashIntensity(self: *const Game) f32 {
+        if (self.hit_flash_timer <= 0.0) return 0.0;
+        return self.hit_flash_timer / hit_flash_duration;
     }
 
     pub fn heroPosition(self: *const Game) [2]f32 {
@@ -110,7 +139,7 @@ test "Game basic movement with WASD-style input" {
     try std.testing.expect(game.player_x > 0.0);
 }
 
-test "Game collision detection + edge-triggered score" {
+test "Game collision detection + edge-triggered score + hit flash" {
     var game = Game.init();
 
     // Place hero at origin.
@@ -129,13 +158,21 @@ test "Game collision detection + edge-triggered score" {
 
     const before_score = game.score;
 
-    // First update with collision should increment score once.
+    // First update with collision should increment score once and start flash.
     game.update(0.0, .{});
     try std.testing.expect(game.score == before_score + 1);
+    try std.testing.expect(game.hit_flash_timer > 0.0);
+    const intensity0 = game.hitFlashIntensity();
+    try std.testing.expect(intensity0 > 0.0);
 
     // Subsequent updates while still colliding should not spam score.
     game.update(0.0, .{});
     try std.testing.expect(game.score == before_score + 1);
+
+    // After enough time, flash should decay to zero.
+    game.update(1.0, .{});
+    try std.testing.expect(game.hit_flash_timer == 0.0);
+    try std.testing.expect(game.hitFlashIntensity() == 0.0);
 }
 
 test "refAllDecls" {

@@ -10,13 +10,13 @@ const frame_time = @import("frame_time");
 const FrameTimer = frame_time.FrameTimer;
 
 const game = @import("game");
-const InputState = game.InputState;
-const Game = game.Game;
 
 const triangle_vert = @embedFile("triangle_vert");
 const triangle_frag = @embedFile("triangle_frag");
 
 const Allocator = std.mem.Allocator;
+const InputState = game.InputState;
+const Game = game.Game;
 
 const VK_FALSE32: vk.Bool32 = @enumFromInt(vk.FALSE);
 const VK_TRUE32: vk.Bool32 = @enumFromInt(vk.TRUE);
@@ -27,14 +27,35 @@ const app_name = "VRGame — Zigadel Prototype";
 // NUL-terminated window title for GLFW.
 const window_title: [:0]const u8 = "VRGame — Zigadel Prototype";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// World geometry (2D hero + enemy)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const hero_template = [_]Vertex{
+    .{ .pos = .{ 0.0, -0.05 }, .color = .{ 0.2, 0.6, 1.0 } }, // hero: blue-ish
+    .{ .pos = .{ 0.04, 0.05 }, .color = .{ 0.2, 0.6, 1.0 } },
+    .{ .pos = .{ -0.04, 0.05 }, .color = .{ 0.2, 0.6, 1.0 } },
+};
+
+const enemy_template = [_]Vertex{
+    .{ .pos = .{ 0.0, -0.05 }, .color = .{ 1.0, 0.5, 0.0 } }, // enemy: orange-ish
+    .{ .pos = .{ 0.04, 0.05 }, .color = .{ 1.0, 0.5, 0.0 } },
+    .{ .pos = .{ -0.04, 0.05 }, .color = .{ 1.0, 0.5, 0.0 } },
+};
+
+const vertex_count: usize = hero_template.len + enemy_template.len;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utility
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn updateWindowTitle(window: *glfw.Window, fps: f64, g: *const Game) void {
-    // Small fixed buffer for the title; avoid heap allocation.
     var buf: [160]u8 = undefined;
 
     const title = std.fmt.bufPrintZ(
         &buf,
-        "VRGame — Zigadel Prototype | FPS: {d:.1} | x: {d:.2}, y: {d:.2} | Score: {d}",
-        .{ fps, g.player_x, g.player_y, g.score },
+        "VRGame — Zigadel Prototype | FPS: {d:.1} | Score: {d} | x: {d:.2}, y: {d:.2}",
+        .{ fps, g.score, g.player_x, g.player_y },
     ) catch {
         // Fallback to the static title if formatting fails for any reason.
         glfw.setWindowTitle(window, window_title);
@@ -159,7 +180,7 @@ pub fn main() !void {
 
     const buffer = try gc.vkd.createBuffer(gc.dev, &.{
         .flags = .{},
-        .size = @sizeOf(@TypeOf(vertices)),
+        .size = @sizeOf(Vertex) * vertex_count,
         .usage = .{
             .transfer_dst_bit = true,
             .vertex_buffer_bit = true,
@@ -175,10 +196,10 @@ pub fn main() !void {
     defer gc.vkd.freeMemory(gc.dev, memory, null);
     try gc.vkd.bindBufferMemory(gc.dev, buffer, memory, 0);
 
-    // Persistent staging buffer (host-visible) used to update the vertices each frame.
+    // Persistent staging buffer (host-visible) used to update geometry each frame.
     const staging_buffer = try gc.vkd.createBuffer(gc.dev, &.{
         .flags = .{},
-        .size = @sizeOf(@TypeOf(vertices)),
+        .size = @sizeOf(Vertex) * vertex_count,
         .usage = .{ .transfer_src_bit = true },
         .sharing_mode = .exclusive,
         .queue_family_index_count = 0,
@@ -218,7 +239,7 @@ pub fn main() !void {
         const dt = @as(f32, @floatCast(tick.dt));
 
         if (tick.fps_updated) {
-            std.log.info("FPS: {d:.2} | Score: {d}", .{ tick.fps, game_state.score });
+            std.log.info("FPS: {d:.2}", .{tick.fps});
             updateWindowTitle(window, tick.fps, &game_state);
         }
 
@@ -230,9 +251,9 @@ pub fn main() !void {
 
         game_state.update(dt, input);
 
-        // Update hero + enemy triangles from game state and upload via staging.
-        try updateTriangleVertices(&gc, staging_memory, &game_state);
-        try copyBuffer(&gc, pool, buffer, staging_buffer, @sizeOf(@TypeOf(vertices)));
+        // Update hero + enemy geometry in staging, then upload to device-local buffer.
+        try updateWorldVertices(&gc, staging_memory, &game_state);
+        try copyBuffer(&gc, pool, buffer, staging_buffer, @sizeOf(Vertex) * vertex_count);
 
         const cmdbuf = cmdbufs[swapchain.image_index];
 
@@ -313,23 +334,10 @@ fn sampleInput(window: *glfw.Window) InputState {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Geometry / vertices
+// World → GPU vertex update
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Two triangles: hero (0..2) and enemy (3..5).
-const vertices = [_]Vertex{
-    // Hero triangle (small, centered)
-    .{ .pos = .{ 0.0, -0.15 }, .color = .{ 0.2, 0.8, 1.0 } },
-    .{ .pos = .{ 0.15, 0.15 }, .color = .{ 0.2, 0.8, 1.0 } },
-    .{ .pos = .{ -0.15, 0.15 }, .color = .{ 0.2, 0.8, 1.0 } },
-
-    // Enemy triangle (similar shape; offset in world space)
-    .{ .pos = .{ 0.0, -0.10 }, .color = .{ 1.0, 0.3, 0.3 } },
-    .{ .pos = .{ 0.10, 0.10 }, .color = .{ 1.0, 0.3, 0.3 } },
-    .{ .pos = .{ -0.10, 0.10 }, .color = .{ 1.0, 0.3, 0.3 } },
-};
-
-fn updateTriangleVertices(
+fn updateWorldVertices(
     gc: *const GraphicsContext,
     staging_memory: vk.DeviceMemory,
     g: *const Game,
@@ -339,85 +347,51 @@ fn updateTriangleVertices(
 
     const gpu_vertices: [*]Vertex = @ptrCast(@alignCast(data));
 
-    const hero = g.heroPosition();
-    const enemy = g.enemyPosition();
+    // World → NDC scale; tune as desired.
+    const scale: f32 = 0.5;
 
-    // Scale world-space movement into NDC so the triangles stay visible.
-    const hero_scale: f32 = 0.2;
-    const enemy_scale: f32 = 0.2;
+    const hero_pos = g.heroPosition();
+    const enemy_pos = g.enemyPosition();
+    const flash = g.hitFlashIntensity();
+    const inv_flash = 1.0 - flash;
 
-    // ── Hero vertices (0..2) ─────────────────────────────────────────────
-    {
-        var i: usize = 0;
-        while (i < 3) : (i += 1) {
-            const base = vertices[i];
-            gpu_vertices[i] = .{
-                .pos = .{
-                    base.pos[0] + hero[0] * hero_scale,
-                    base.pos[1] + hero[1] * hero_scale,
-                },
-                .color = base.color, // hero stays cyan-ish
-            };
-        }
+    // Hero (no flash)
+    for (hero_template, 0..) |v, i| {
+        gpu_vertices[i] = .{
+            .pos = .{
+                v.pos[0] + hero_pos[0] * scale,
+                // Flip Y so +world-y = up on screen.
+                v.pos[1] - hero_pos[1] * scale,
+            },
+            .color = v.color,
+        };
     }
 
-    // ── Enemy vertices (3..5) ────────────────────────────────────────────
-    const enemy_hit = g.isColliding();
-    const enemy_color: [3]f32 = if (enemy_hit)
-        .{ 0.2, 1.0, 0.3 } // green when tagged
-    else
-        .{ 1.0, 0.3, 0.3 }; // red otherwise
+    // Enemy (flash white when recently hit)
+    const enemy_offset = hero_template.len;
+    for (enemy_template, 0..) |v, j| {
+        const idx = enemy_offset + j;
 
-    {
-        var i: usize = 3;
-        while (i < 6) : (i += 1) {
-            const base = vertices[i];
-            gpu_vertices[i] = .{
-                .pos = .{
-                    base.pos[0] + enemy[0] * enemy_scale,
-                    base.pos[1] + enemy[1] * enemy_scale,
-                },
-                .color = enemy_color,
-            };
-        }
+        const base = v.color;
+        const flash_color = [_]f32{ 1.0, 1.0, 1.0 };
+
+        gpu_vertices[idx] = .{
+            .pos = .{
+                v.pos[0] + enemy_pos[0] * scale,
+                v.pos[1] - enemy_pos[1] * scale,
+            },
+            .color = .{
+                base[0] * inv_flash + flash_color[0] * flash,
+                base[1] * inv_flash + flash_color[1] * flash,
+                base[2] * inv_flash + flash_color[2] * flash,
+            },
+        };
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Upload vertices (one-shot helper, currently unused but kept for reference)
+// Upload / copy helper
 // ─────────────────────────────────────────────────────────────────────────────
-
-fn uploadVertices(gc: *const GraphicsContext, pool: vk.CommandPool, buffer: vk.Buffer) !void {
-    const staging_buffer = try gc.vkd.createBuffer(gc.dev, &.{
-        .flags = .{},
-        .size = @sizeOf(@TypeOf(vertices)),
-        .usage = .{ .transfer_src_bit = true },
-        .sharing_mode = .exclusive,
-        .queue_family_index_count = 0,
-        .p_queue_family_indices = undefined,
-    }, null);
-    defer gc.vkd.destroyBuffer(gc.dev, staging_buffer, null);
-
-    const mem_reqs = gc.vkd.getBufferMemoryRequirements(gc.dev, staging_buffer);
-    const staging_memory = try gc.allocate(mem_reqs, .{
-        .host_visible_bit = true,
-        .host_coherent_bit = true,
-    });
-    defer gc.vkd.freeMemory(gc.dev, staging_memory, null);
-    try gc.vkd.bindBufferMemory(gc.dev, staging_buffer, staging_memory, 0);
-
-    {
-        const data = try gc.vkd.mapMemory(gc.dev, staging_memory, 0, vk.WHOLE_SIZE, .{});
-        defer gc.vkd.unmapMemory(gc.dev, staging_memory);
-
-        const gpu_vertices: [*]Vertex = @ptrCast(@alignCast(data));
-        for (vertices, 0..) |vertex, i| {
-            gpu_vertices[i] = vertex;
-        }
-    }
-
-    try copyBuffer(gc, pool, buffer, staging_buffer, @sizeOf(@TypeOf(vertices)));
-}
 
 fn copyBuffer(
     gc: *const GraphicsContext,
@@ -547,7 +521,8 @@ fn createCommandBuffers(
             &offset,
         );
 
-        gc.vkd.cmdDraw(cmdbuf, vertices.len, 1, 0, 0);
+        // Draw both hero + enemy (6 vertices total).
+        gc.vkd.cmdDraw(cmdbuf, @intCast(vertex_count), 1, 0, 0);
 
         gc.vkd.cmdEndRenderPass(cmdbuf);
         try gc.vkd.endCommandBuffer(cmdbuf);
