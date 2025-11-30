@@ -13,7 +13,7 @@ pub const TickResult = struct {
 };
 
 /// Simple, robust frame timer based on millisecond timestamps.
-/// Designed to be trivial to reuse in ZGE.
+/// Designed to be trivial to reuse in ZGE / Zigadel demos.
 pub const FrameTimer = struct {
     /// Last timestamp in milliseconds (monotonic assumption).
     last_ms: i64,
@@ -49,7 +49,7 @@ pub const FrameTimer = struct {
             };
         }
 
-        const dt_ms: i64 = now_ms - self.last_ms;
+        const dt_ms = now_ms - self.last_ms;
         self.last_ms = now_ms;
 
         self.accum_ms += dt_ms;
@@ -57,20 +57,16 @@ pub const FrameTimer = struct {
 
         var fps_updated = false;
 
-        // Compute FPS over a *fixed* sample window, not the whole accumulated span.
-        if (self.fps_sample_interval_ms > 0 and self.accum_ms >= self.fps_sample_interval_ms) {
-            const interval_s = @as(f64, @floatFromInt(self.fps_sample_interval_ms)) / 1000.0;
-            if (interval_s > 0.0) {
+        if (self.accum_ms >= self.fps_sample_interval_ms and self.fps_sample_interval_ms > 0) {
+            const window_s = @as(f64, @floatFromInt(self.accum_ms)) / 1000.0;
+            if (window_s > 0.0) {
                 self.current_fps =
-                    @as(f64, @floatFromInt(self.frames_in_window)) / interval_s;
+                    @as(f64, @floatFromInt(self.frames_in_window)) / window_s;
             } else {
                 self.current_fps = 0.0;
             }
 
-            // Keep any overflow so we don't "lose" long-frame time.
-            self.accum_ms -= self.fps_sample_interval_ms;
-            if (self.accum_ms < 0) self.accum_ms = 0;
-
+            self.accum_ms = 0;
             self.frames_in_window = 0;
             fps_updated = true;
         }
@@ -92,23 +88,22 @@ pub const FrameTimer = struct {
 test "FrameTimer basic progression and FPS window" {
     var timer = FrameTimer.init(0, 1000);
 
-    // 60 frames at ~16 ms ≈ 960 ms (no FPS sample yet).
+    // 9 frames at 100 ms → 900 ms total, no FPS sample yet.
     var i: usize = 0;
-    while (i < 60) : (i += 1) {
-        const now_ms: i64 = @intCast((i + 1) * 16);
+    while (i < 9) : (i += 1) {
+        const now_ms: i64 = @intCast((i + 1) * 100); // 100, 200, ..., 900
         const res = timer.tick(now_ms);
         try std.testing.expect(res.dt > 0.0);
-        if (i < 59) {
-            try std.testing.expect(!res.fps_updated);
-        }
+        try std.testing.expect(!res.fps_updated);
     }
 
-    // Push over the 1s window.
-    const res2 = timer.tick(2000);
-    try std.testing.expect(res2.fps_updated);
-    // We're somewhere in the rough 40–80 FPS range.
-    try std.testing.expect(res2.fps > 40.0);
-    try std.testing.expect(res2.fps < 80.0);
+    // 10th frame at 1000 ms pushes us over the 1s window:
+    const res10 = timer.tick(1000);
+    try std.testing.expect(res10.fps_updated);
+
+    // 10 frames over ~1.0 seconds → ~10 FPS.
+    const expected_fps: f64 = 10.0;
+    try std.testing.expectApproxEqAbs(expected_fps, res10.fps, 0.0001);
 }
 
 test "FrameTimer handles non-monotonic timestamps" {
@@ -124,6 +119,6 @@ test "FrameTimer handles non-monotonic timestamps" {
     try std.testing.expectEqual(r1.fps, r2.fps);
 }
 
-test "refAllDecls" {
+test "refAllDecls(frame_time)" {
     std.testing.refAllDecls(@This());
 }

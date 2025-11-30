@@ -1,7 +1,7 @@
 const std = @import("std");
 
-/// High-level input state for the game.
-/// Platform code (GLFW, etc.) should map raw events into this struct.
+/// Engine-agnostic input snapshot for a single frame.
+/// Main maps GLFW state into this.
 pub const InputState = struct {
     move_forward: bool = false,
     move_backward: bool = false,
@@ -10,31 +10,29 @@ pub const InputState = struct {
     quit: bool = false,
 };
 
-/// Core game state for the simple demo.
-/// For now this is just a 2D "player" position driven by WASD-like input.
+/// Minimal "game core" for the demo.
+/// Right now: a single player with a 2D position and constant move speed.
+/// Later: hero state, abilities, cooldowns, projectiles, etc.
 pub const Game = struct {
-    /// Player position in a simple 2D world-space.
-    player_x: f32,
-    player_y: f32,
+    /// Arbitrary units; interpreted by renderer however it wants.
+    player_x: f32 = 0.0,
+    player_y: f32 = 0.0,
 
-    /// Construct a new game with default starting state.
+    /// Units per second.
+    move_speed: f32 = 3.5,
+
     pub fn init() Game {
-        return .{
-            .player_x = 0.0,
-            .player_y = 0.0,
-        };
+        return .{};
     }
 
-    /// Advance game simulation by `dt` seconds given the abstract input state.
+    /// Advance game state by `dt` seconds under the given input.
     pub fn update(self: *Game, dt: f32, input: InputState) void {
-        const move_speed: f32 = 3.5; // units per second (arbitrary units for now)
+        const s = self.move_speed;
 
-        if (input.move_forward) self.player_y += move_speed * dt;
-        if (input.move_backward) self.player_y -= move_speed * dt;
-        if (input.move_left) self.player_x -= move_speed * dt;
-        if (input.move_right) self.player_x += move_speed * dt;
-
-        // Later: camera, abilities, projectiles, hero state machine, etc.
+        if (input.move_forward) self.player_y += s * dt;
+        if (input.move_backward) self.player_y -= s * dt;
+        if (input.move_left) self.player_x -= s * dt;
+        if (input.move_right) self.player_x += s * dt;
     }
 };
 
@@ -43,28 +41,27 @@ pub const Game = struct {
 // ─────────────────────────────────────────────────────────────────────────────
 
 test "Game basic movement with WASD-style input" {
-    var game = Game.init();
+    var g = Game.init();
 
     // No movement when no input.
-    game.update(1.0, .{});
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), game.player_x, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), game.player_y, 0.0001);
+    g.update(1.0, .{});
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), g.player_x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), g.player_y, 0.0001);
 
     // Move forward for 1 second.
-    game.update(1.0, .{ .move_forward = true });
-    try std.testing.expect(game.player_y > 0.0);
-
-    const y_after_forward = game.player_y;
+    g.update(1.0, .{ .move_forward = true });
+    try std.testing.expect(g.player_y > 0.0);
+    const y_after_forward = g.player_y;
 
     // Move backward for 0.5 seconds; should reduce y a bit.
-    game.update(0.5, .{ .move_backward = true });
-    try std.testing.expect(game.player_y < y_after_forward);
+    g.update(0.5, .{ .move_backward = true });
+    try std.testing.expect(g.player_y < y_after_forward);
 
     // Move right for 2 seconds; x should increase.
-    game.update(2.0, .{ .move_right = true });
-    try std.testing.expect(game.player_x > 0.0);
+    g.update(2.0, .{ .move_right = true });
+    try std.testing.expect(g.player_x > 0.0);
 }
 
-test "refAllDecls (game module)" {
+test "refAllDecls(game)" {
     std.testing.refAllDecls(@This());
 }

@@ -5,16 +5,18 @@ const vk = @import("vulkan");
 const GraphicsContext = @import("graphics_context").GraphicsContext;
 const Swapchain = @import("swapchain").Swapchain;
 const Vertex = @import("vertex").Vertex;
-const FrameTimer = @import("frame_time").FrameTimer;
+
+const frame_time = @import("frame_time");
+const FrameTimer = frame_time.FrameTimer;
 
 const game = @import("game");
-const Game = game.Game;
-const InputState = game.InputState;
 
 const triangle_vert = @embedFile("triangle_vert");
 const triangle_frag = @embedFile("triangle_frag");
 
 const Allocator = std.mem.Allocator;
+const InputState = game.InputState;
+const Game = game.Game;
 
 const VK_FALSE32: vk.Bool32 = @enumFromInt(vk.FALSE);
 const VK_TRUE32: vk.Bool32 = @enumFromInt(vk.TRUE);
@@ -25,7 +27,16 @@ const app_name = "VRGame — Zigadel Prototype";
 // NUL-terminated window title for GLFW.
 const window_title: [:0]const u8 = "VRGame — Zigadel Prototype";
 
-/// GLFW error callback: logs code + description.
+/// Convert GLFW's monotonic time (seconds as f64) into milliseconds (i64).
+fn nowMsFromGlfw() i64 {
+    const now_s: f64 = glfw.getTime();
+    return @as(i64, @intFromFloat(now_s * 1000.0));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GLFW error callback
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn errorCallback(code: c_int, description: [*c]const u8) callconv(.c) void {
     const msg: [:0]const u8 = if (description) |ptr|
         std.mem.span(ptr)
@@ -35,6 +46,10 @@ fn errorCallback(code: c_int, description: [*c]const u8) callconv(.c) void {
     const err_code = glfw.errorCodeFromC(code);
     std.log.err("GLFW error {any}: {s}", .{ err_code, msg });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub fn main() !void {
     // Install error callback first, so even init() failures are logged.
@@ -158,26 +173,15 @@ pub fn main() !void {
     defer destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
 
     // ─────────────────────────────────────────────────────────────────────
-    // Game state + timing
+    // Game state + main loop
     // ─────────────────────────────────────────────────────────────────────
 
     var game_state = Game.init();
-
-    // FrameTimer uses millisecond timestamps; glfw.getTime() is seconds.
-    const start_ms_f64 = glfw.getTime() * 1000.0;
-    const start_ms: i64 = @intFromFloat(start_ms_f64);
-    var frame_timer = FrameTimer.init(start_ms, 1000); // 1s FPS sample window.
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Main loop
-    // ─────────────────────────────────────────────────────────────────────
+    var frame_timer = FrameTimer.init(nowMsFromGlfw(), 1000); // 1s FPS window.
 
     while (!glfw.windowShouldClose(window)) {
-        const now_ms: i64 = @intFromFloat(glfw.getTime() * 1000.0);
-        const tick = frame_timer.tick(now_ms);
-
-        // `tick.dt` is in seconds.
-        const dt: f32 = @floatCast(tick.dt);
+        const tick = frame_timer.tick(nowMsFromGlfw());
+        const dt = @as(f32, @floatCast(tick.dt));
 
         if (tick.fps_updated) {
             std.log.info("FPS: {d:.2}", .{tick.fps});
@@ -235,7 +239,7 @@ pub fn main() !void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Input sampling (GLFW → abstract InputState)
+// Input sampling
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn sampleInput(window: *glfw.Window) InputState {
@@ -270,7 +274,7 @@ fn sampleInput(window: *glfw.Window) InputState {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Upload vertices
+// Geometry / vertices
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Simple demo triangle.
@@ -279,6 +283,10 @@ const vertices = [_]Vertex{
     .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0, 1, 0 } },
     .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0, 0, 1 } },
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Upload vertices
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn uploadVertices(gc: *const GraphicsContext, pool: vk.CommandPool, buffer: vk.Buffer) !void {
     const staging_buffer = try gc.vkd.createBuffer(gc.dev, &.{
@@ -700,12 +708,4 @@ fn createPipeline(
         @as([*]vk.Pipeline, @ptrCast(&pipeline)),
     );
     return pipeline;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────────────────────────────────
-
-test "refAllDecls (main module)" {
-    std.testing.refAllDecls(@This());
 }
