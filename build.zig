@@ -9,6 +9,7 @@ fn linkVulkanLoader(
 
     switch (os_tag) {
         .windows => {
+            // Try to locate the Vulkan SDK and add its Lib directory.
             const sdk = std.process.getEnvVarOwned(b.allocator, "VULKAN_SDK") catch null;
             if (sdk) |sdk_path| {
                 defer b.allocator.free(sdk_path);
@@ -19,6 +20,7 @@ fn linkVulkanLoader(
                     exe.addLibraryPath(.{ .cwd_relative = ld });
                 }
             }
+
             exe.linkSystemLibrary("vulkan-1");
         },
         .linux => {
@@ -31,7 +33,7 @@ fn linkVulkanLoader(
     }
 }
 
-/// Ensure we have a workspace-local ./registry/vk.xml (download once if missing).
+/// Ensure we have a *workspace* ./registry/vk.xml.
 fn ensureVkRegistry(b: *std.Build) std.Build.LazyPath {
     const xml_rel = "registry/vk.xml";
     const registry_dir = "registry";
@@ -104,7 +106,7 @@ fn ensureVkRegistry(b: *std.Build) std.Build.LazyPath {
     return b.path(xml_rel);
 }
 
-/// Ensure we have a workspace-local ./registry/xr.xml compatible with openxr-zig.
+/// Ensure we have a *workspace* ./registry/xr.xml matching the pinned openxr-zig commit.
 fn ensureXrRegistry(b: *std.Build) std.Build.LazyPath {
     const cwd = std.fs.cwd();
     const registry_dir = "registry";
@@ -124,7 +126,10 @@ fn ensureXrRegistry(b: *std.Build) std.Build.LazyPath {
             std.log.info("Using xr.xml from VRGAME_XR_XML={s}", .{env_path});
             return b.path(env_path);
         } else |err| {
-            std.log.warn("VRGAME_XR_XML={s} but failed to open: {s}", .{ env_path, @errorName(err) });
+            std.log.warn("VRGAME_XR_XML={s} but failed to open: {s}", .{
+                env_path,
+                @errorName(err),
+            });
         }
     } else |_| {}
 
@@ -206,7 +211,7 @@ fn ensureXrRegistry(b: *std.Build) std.Build.LazyPath {
     return b.path(xml_rel);
 }
 
-/// Helper: add a zig test for a module and wrap it in a run step.
+/// Helper to wrap `zig test` into a Run step.
 fn addTestRun(b: *std.Build, root_mod: *std.Build.Module) *std.Build.Step.Run {
     const t = b.addTest(.{ .root_module = root_mod });
     return b.addRunArtifact(t);
@@ -219,9 +224,7 @@ pub fn build(b: *std.Build) void {
     const vk_registry = ensureVkRegistry(b);
     const xr_registry = ensureXrRegistry(b);
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Dependencies
-    // ─────────────────────────────────────────────────────────────────────
+    // ── Dependencies ────────────────────────────────────────────────────────
 
     const glfw_dep = b.dependency("glfw_zig", .{
         .target = target,
@@ -253,9 +256,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Internal modules (ZTable-style wiring)
-    // ─────────────────────────────────────────────────────────────────────
+    // ── Internal modules (library-style wiring) ─────────────────────────────
 
     const vertex_mod = b.createModule(.{
         .root_source_file = b.path("src/graphics/vertex.zig"),
@@ -263,6 +264,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     vertex_mod.addImport("vulkan", vk_mod);
+
+    const frame_time_mod = b.createModule(.{
+        .root_source_file = b.path("src/game/frame_time.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const game_mod = b.createModule(.{
+        .root_source_file = b.path("src/game/game.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const graphics_context_mod = b.createModule(.{
         .root_source_file = b.path("src/graphics/graphics_context.zig"),
@@ -283,14 +296,8 @@ pub fn build(b: *std.Build) void {
     swapchain_mod.addImport("graphics_context", graphics_context_mod);
     swapchain_mod.addImport("vertex", vertex_mod);
 
-    // ✅ THIS is the important fix: point to src/game/frame_time.zig.
-    const frame_time_mod = b.createModule(.{
-        .root_source_file = b.path("src/game/frame_time.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // ── Public facade module (`@import("vrgame")`) ──────────────────────────
 
-    // Facade module (src/root.zig), exported as "vrgame".
     const vrgame_root = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -300,8 +307,10 @@ pub fn build(b: *std.Build) void {
     vrgame_root.addImport("swapchain", swapchain_mod);
     vrgame_root.addImport("vertex", vertex_mod);
     vrgame_root.addImport("frame_time", frame_time_mod);
+    vrgame_root.addImport("game", game_mod);
 
-    // Root module for executable (src/main.zig).
+    // ── Executable entry module ─────────────────────────────────────────────
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -316,9 +325,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("frame_time", frame_time_mod);
     exe_mod.addImport("vrgame", vrgame_root);
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Shader compilation (glslc → SPIR-V → @embedFile)
-    // ─────────────────────────────────────────────────────────────────────
+    // ── Shader compilation (glslc → SPIR-V → @embedFile) ───────────────────
 
     const compile_vert_shader = b.addSystemCommand(&.{"glslc"});
     compile_vert_shader.addFileArg(b.path("shaders/triangle.vert"));
@@ -336,9 +343,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = triangle_frag_spv,
     });
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Executable + run step
-    // ─────────────────────────────────────────────────────────────────────
+    // ── Executable + run step ──────────────────────────────────────────────
 
     const exe = b.addExecutable(.{
         .name = "vrgame",
@@ -360,27 +365,27 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the Vulkan + OpenXR triangle demo");
     run_step.dependOn(&run_cmd.step);
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Tests – per-module (no test_all_unit.zig)
-    // ─────────────────────────────────────────────────────────────────────
+    // ── Tests (ZTable style, no test_all_unit.zig) ─────────────────────────
 
     const unit_step = b.step("test-unit", "Run unit tests (vrgame modules)");
     const integration_step = b.step("test-integration", "Run integration tests");
     const e2e_step = b.step("test-e2e", "Run end-to-end tests");
 
-    const run_main_tests = addTestRun(b, exe_mod);
+    const run_root_tests = addTestRun(b, vrgame_root);
+    const run_game_tests = addTestRun(b, game_mod);
+    const run_frame_time_tests = addTestRun(b, frame_time_mod);
     const run_graphics_context_tests = addTestRun(b, graphics_context_mod);
     const run_swapchain_tests = addTestRun(b, swapchain_mod);
-    const run_vertex_tests = addTestRun(b, vertex_mod);
-    const run_frame_time_tests = addTestRun(b, frame_time_mod);
+    const run_main_tests = addTestRun(b, exe_mod);
 
-    unit_step.dependOn(&run_main_tests.step);
+    unit_step.dependOn(&run_root_tests.step);
+    unit_step.dependOn(&run_game_tests.step);
+    unit_step.dependOn(&run_frame_time_tests.step);
     unit_step.dependOn(&run_graphics_context_tests.step);
     unit_step.dependOn(&run_swapchain_tests.step);
-    unit_step.dependOn(&run_vertex_tests.step);
-    unit_step.dependOn(&run_frame_time_tests.step);
+    unit_step.dependOn(&run_main_tests.step);
 
-    // Optional integration aggregator: tests/test_all_integration.zig
+    // Optional aggregators if you create them later.
     const have_integration = blk: {
         _ = std.fs.cwd().statFile("tests/test_all_integration.zig") catch break :blk false;
         break :blk true;
@@ -405,7 +410,6 @@ pub fn build(b: *std.Build) void {
         integration_step.dependOn(&run_integration.step);
     }
 
-    // Optional e2e aggregator: tests/test_all_e2e.zig
     const have_e2e = blk: {
         _ = std.fs.cwd().statFile("tests/test_all_e2e.zig") catch break :blk false;
         break :blk true;
