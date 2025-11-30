@@ -330,6 +330,12 @@ pub fn build(b: *std.Build) void {
     swapchain_mod.addImport("graphics_context", graphics_context_mod);
     swapchain_mod.addImport("vertex", vertex_mod);
 
+    const math3d_mod = b.createModule(.{
+        .root_source_file = b.path("src/math/math3d.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const frame_time_mod = b.createModule(.{
         .root_source_file = b.path("src/game/frame_time.zig"),
         .target = target,
@@ -342,6 +348,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const camera_mod = b.createModule(.{
+        .root_source_file = b.path("src/game/camera.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const camera3d_mod = b.createModule(.{
+        .root_source_file = b.path("src/game/camera3d.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    camera3d_mod.addImport("math3d", math3d_mod);
+
     // Root facade module (like ztable/src/root.zig)
     const vrgame_root = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -353,6 +372,9 @@ pub fn build(b: *std.Build) void {
     vrgame_root.addImport("vertex", vertex_mod);
     vrgame_root.addImport("frame_time", frame_time_mod);
     vrgame_root.addImport("game", game_mod);
+    vrgame_root.addImport("camera", camera_mod);
+    vrgame_root.addImport("math3d", math3d_mod);
+    vrgame_root.addImport("camera3d", camera3d_mod);
 
     // ─────────────────────────────────────────────────────────────────────
     // Root module for vrgame (exe entrypoint)
@@ -372,7 +394,10 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("vertex", vertex_mod);
     exe_mod.addImport("frame_time", frame_time_mod);
     exe_mod.addImport("game", game_mod);
+    exe_mod.addImport("camera", camera_mod);
     exe_mod.addImport("vrgame", vrgame_root);
+    exe_mod.addImport("math3d", math3d_mod);
+    exe_mod.addImport("camera3d", camera3d_mod);
 
     // ─────────────────────────────────────────────────────────────────────
     // Shader compilation (glslc → SPIR-V → @embedFile)
@@ -444,7 +469,10 @@ pub fn build(b: *std.Build) void {
     const run_vertex_tests = addTestRun(b, vertex_mod);
     const run_frame_time_tests = addTestRun(b, frame_time_mod);
     const run_game_tests = addTestRun(b, game_mod);
+    const run_camera_tests = addTestRun(b, camera_mod);
     const run_vrgame_root_tests = addTestRun(b, vrgame_root);
+    const run_math3d_tests = addTestRun(b, math3d_mod);
+    const run_camera3d_tests = addTestRun(b, camera3d_mod);
 
     unit_step.dependOn(&run_main_tests.step);
     unit_step.dependOn(&run_graphics_context_tests.step);
@@ -452,7 +480,10 @@ pub fn build(b: *std.Build) void {
     unit_step.dependOn(&run_vertex_tests.step);
     unit_step.dependOn(&run_frame_time_tests.step);
     unit_step.dependOn(&run_game_tests.step);
+    unit_step.dependOn(&run_camera_tests.step);
     unit_step.dependOn(&run_vrgame_root_tests.step);
+    unit_step.dependOn(&run_math3d_tests.step);
+    unit_step.dependOn(&run_camera3d_tests.step);
 
     // --- Integration (optional aggregator: tests/test_all_integration.zig) --
 

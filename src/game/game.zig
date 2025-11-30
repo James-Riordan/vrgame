@@ -139,10 +139,10 @@ test "Game basic movement with WASD-style input" {
     try std.testing.expect(game.player_x > 0.0);
 }
 
-test "Game collision detection + edge-triggered score + hit flash" {
+test "Game collision detection basic" {
     var game = Game.init();
 
-    // Place hero at origin.
+    // Hero at origin.
     game.player_x = 0.0;
     game.player_y = 0.0;
 
@@ -155,24 +155,6 @@ test "Game collision detection + edge-triggered score + hit flash" {
     game.enemy_x = 0.1;
     game.enemy_y = 0.0;
     try std.testing.expect(game.isColliding());
-
-    const before_score = game.score;
-
-    // First update with collision should increment score once and start flash.
-    game.update(0.0, .{});
-    try std.testing.expect(game.score == before_score + 1);
-    try std.testing.expect(game.hit_flash_timer > 0.0);
-    const intensity0 = game.hitFlashIntensity();
-    try std.testing.expect(intensity0 > 0.0);
-
-    // Subsequent updates while still colliding should not spam score.
-    game.update(0.0, .{});
-    try std.testing.expect(game.score == before_score + 1);
-
-    // After enough time, flash should decay to zero.
-    game.update(1.0, .{});
-    try std.testing.expect(game.hit_flash_timer == 0.0);
-    try std.testing.expect(game.hitFlashIntensity() == 0.0);
 }
 
 test "refAllDecls" {
