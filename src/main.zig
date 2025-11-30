@@ -27,6 +27,23 @@ const app_name = "VRGame — Zigadel Prototype";
 // NUL-terminated window title for GLFW.
 const window_title: [:0]const u8 = "VRGame — Zigadel Prototype";
 
+fn updateWindowTitle(window: *glfw.Window, fps: f64, g: Game) void {
+    // Small fixed buffer for the title; avoid heap allocation.
+    var buf: [128]u8 = undefined;
+
+    const title = std.fmt.bufPrintZ(
+        &buf,
+        "VRGame — Zigadel Prototype | FPS: {d:.1} | x: {d:.2}, y: {d:.2}",
+        .{ fps, g.player_x, g.player_y },
+    ) catch {
+        // Fallback to the static title if formatting fails for any reason.
+        glfw.setWindowTitle(window, window_title);
+        return;
+    };
+
+    glfw.setWindowTitle(window, title);
+}
+
 /// Convert GLFW's monotonic time (seconds as f64) into milliseconds (i64).
 fn nowMsFromGlfw() i64 {
     const now_s: f64 = glfw.getTime();
@@ -158,7 +175,24 @@ pub fn main() !void {
     defer gc.vkd.freeMemory(gc.dev, memory, null);
     try gc.vkd.bindBufferMemory(gc.dev, buffer, memory, 0);
 
-    try uploadVertices(&gc, pool, buffer);
+    // Persistent staging buffer (host-visible) used to update the triangle each frame.
+    const staging_buffer = try gc.vkd.createBuffer(gc.dev, &.{
+        .flags = .{},
+        .size = @sizeOf(@TypeOf(vertices)),
+        .usage = .{ .transfer_src_bit = true },
+        .sharing_mode = .exclusive,
+        .queue_family_index_count = 0,
+        .p_queue_family_indices = undefined,
+    }, null);
+    defer gc.vkd.destroyBuffer(gc.dev, staging_buffer, null);
+
+    const staging_reqs = gc.vkd.getBufferMemoryRequirements(gc.dev, staging_buffer);
+    const staging_memory = try gc.allocate(staging_reqs, .{
+        .host_visible_bit = true,
+        .host_coherent_bit = true,
+    });
+    defer gc.vkd.freeMemory(gc.dev, staging_memory, null);
+    try gc.vkd.bindBufferMemory(gc.dev, staging_buffer, staging_memory, 0);
 
     var cmdbufs = try createCommandBuffers(
         &gc,
@@ -185,6 +219,7 @@ pub fn main() !void {
 
         if (tick.fps_updated) {
             std.log.info("FPS: {d:.2}", .{tick.fps});
+            updateWindowTitle(window, tick.fps, game_state);
         }
 
         const input = sampleInput(window);
@@ -194,6 +229,9 @@ pub fn main() !void {
         }
 
         game_state.update(dt, input);
+
+        try updateTriangleVertices(&gc, staging_memory, game_state);
+        try copyBuffer(&gc, pool, buffer, staging_buffer, @sizeOf(@TypeOf(vertices)));
 
         const cmdbuf = cmdbufs[swapchain.image_index];
 
@@ -283,6 +321,30 @@ const vertices = [_]Vertex{
     .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0, 1, 0 } },
     .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0, 0, 1 } },
 };
+
+fn updateTriangleVertices(
+    gc: *const GraphicsContext,
+    staging_memory: vk.DeviceMemory,
+    g: Game,
+) !void {
+    const data = try gc.vkd.mapMemory(gc.dev, staging_memory, 0, vk.WHOLE_SIZE, .{});
+    defer gc.vkd.unmapMemory(gc.dev, staging_memory);
+
+    const gpu_vertices: [*]Vertex = @ptrCast(@alignCast(data));
+
+    // Scale world-space moves to NDC so the triangle doesn't fly off-screen.
+    const scale: f32 = 0.2;
+
+    for (vertices, 0..) |v, i| {
+        gpu_vertices[i] = .{
+            .pos = .{
+                v.pos[0] + g.player_x * scale,
+                v.pos[1] + g.player_y * scale,
+            },
+            .color = v.color,
+        };
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Upload vertices
