@@ -9,12 +9,12 @@ const Vertex = @import("vertex").Vertex;
 const frame_time = @import("frame_time");
 const FrameTimer = frame_time.FrameTimer;
 
-const math3d = @import("math3d");
-const Vec3 = math3d.Vec3;
-
 const camera3d = @import("camera3d");
 const Camera3D = camera3d.Camera3D;
 const CameraInput = camera3d.CameraInput;
+
+const math3d = @import("math3d");
+const Vec3 = math3d.Vec3;
 
 const triangle_vert = @embedFile("triangle_vert");
 const triangle_frag = @embedFile("triangle_frag");
@@ -31,48 +31,24 @@ const app_name = "VRGame — Zigadel Prototype";
 const window_title: [:0]const u8 = "VRGame — Zigadel Prototype";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Simple 3D scene geometry in *world* space
+// Simple 3D scene geometry (two small “ships” / markers)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SceneVertex = struct {
-    pos: [3]f32,
-    color: [3]f32,
+const hero_template = [_]Vertex{
+    .{ .pos = .{ 0.0, 0.20, 0.0 }, .color = .{ 0.9, 0.9, 0.9 } }, // tip
+    .{ .pos = .{ -0.12, -0.12, 0.0 }, .color = .{ 0.2, 0.8, 1.0 } },
+    .{ .pos = .{ 0.12, -0.12, 0.0 }, .color = .{ 0.2, 0.8, 1.0 } },
 };
 
-/// Very simple scene:
-/// - A big ground quad in XZ-plane (y = 0)
-/// - A small red pyramid at the origin
-const scene_vertices = [_]SceneVertex{
-    // Ground plane (two triangles forming a big square)
-    .{ .pos = .{ -5.0, 0.0, -5.0 }, .color = .{ 0.1, 0.4, 0.1 } },
-    .{ .pos = .{ 5.0, 0.0, -5.0 }, .color = .{ 0.1, 0.4, 0.1 } },
-    .{ .pos = .{ 5.0, 0.0, 5.0 }, .color = .{ 0.1, 0.6, 0.1 } },
-
-    .{ .pos = .{ -5.0, 0.0, -5.0 }, .color = .{ 0.1, 0.4, 0.1 } },
-    .{ .pos = .{ 5.0, 0.0, 5.0 }, .color = .{ 0.1, 0.6, 0.1 } },
-    .{ .pos = .{ -5.0, 0.0, 5.0 }, .color = .{ 0.1, 0.6, 0.1 } },
-
-    // Pyramid on the ground at the origin
-    .{ .pos = .{ 0.0, 1.0, 0.0 }, .color = .{ 0.8, 0.2, 0.2 } }, // top
-    .{ .pos = .{ -0.5, 0.0, -0.5 }, .color = .{ 0.8, 0.4, 0.4 } },
-    .{ .pos = .{ 0.5, 0.0, -0.5 }, .color = .{ 0.8, 0.4, 0.4 } },
-
-    .{ .pos = .{ 0.0, 1.0, 0.0 }, .color = .{ 0.8, 0.2, 0.2 } },
-    .{ .pos = .{ 0.5, 0.0, -0.5 }, .color = .{ 0.8, 0.4, 0.4 } },
-    .{ .pos = .{ 0.5, 0.0, 0.5 }, .color = .{ 0.8, 0.4, 0.4 } },
-
-    .{ .pos = .{ 0.0, 1.0, 0.0 }, .color = .{ 0.8, 0.2, 0.2 } },
-    .{ .pos = .{ 0.5, 0.0, 0.5 }, .color = .{ 0.8, 0.4, 0.4 } },
-    .{ .pos = .{ -0.5, 0.0, 0.5 }, .color = .{ 0.8, 0.4, 0.4 } },
-
-    .{ .pos = .{ 0.0, 1.0, 0.0 }, .color = .{ 0.8, 0.2, 0.2 } },
-    .{ .pos = .{ -0.5, 0.0, 0.5 }, .color = .{ 0.8, 0.4, 0.4 } },
-    .{ .pos = .{ -0.5, 0.0, -0.5 }, .color = .{ 0.8, 0.4, 0.4 } },
+const enemy_template = [_]Vertex{
+    .{ .pos = .{ 0.0, 0.22, 0.0 }, .color = .{ 1.0, 0.3, 0.3 } },
+    .{ .pos = .{ -0.14, -0.14, 0.0 }, .color = .{ 0.8, 0.2, 0.2 } },
+    .{ .pos = .{ 0.14, -0.14, 0.0 }, .color = .{ 0.8, 0.2, 0.2 } },
 };
 
-const TOTAL_VERTICES: u32 = scene_vertices.len;
+const TOTAL_VERTICES: u32 = hero_template.len + enemy_template.len;
 const VERTEX_BUFFER_SIZE: vk.DeviceSize =
-    @intCast(@as(usize, scene_vertices.len) * @sizeOf(Vertex));
+    @intCast(@as(usize, TOTAL_VERTICES) * @sizeOf(Vertex));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utility
@@ -116,6 +92,54 @@ fn errorCallback(code: c_int, description: [*c]const u8) callconv(.c) void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Camera input sampling (WASD + Space/Ctrl + RMB look)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn sampleCameraInput(window: *glfw.Window) CameraInput {
+    var ci: CameraInput = .{};
+
+    const Key = struct {
+        fn isDown(w: *glfw.Window, key: c_int) bool {
+            const s = glfw.getKey(w, key);
+            return s == glfw.c.GLFW_PRESS or s == glfw.c.GLFW_REPEAT;
+        }
+    };
+
+    // Movement in camera space
+    if (Key.isDown(window, glfw.c.GLFW_KEY_W)) ci.move_forward = true;
+    if (Key.isDown(window, glfw.c.GLFW_KEY_S)) ci.move_backward = true;
+    if (Key.isDown(window, glfw.c.GLFW_KEY_A)) ci.move_left = true;
+    if (Key.isDown(window, glfw.c.GLFW_KEY_D)) ci.move_right = true;
+    if (Key.isDown(window, glfw.c.GLFW_KEY_SPACE)) ci.move_up = true;
+    if (Key.isDown(window, glfw.c.GLFW_KEY_LEFT_CONTROL)) ci.move_down = true;
+
+    // Mouse look when RMB held.
+    const CursorState = struct {
+        var last_pos: ?[2]f64 = null;
+    };
+
+    const rmb = glfw.getMouseButton(window, glfw.c.GLFW_MOUSE_BUTTON_RIGHT);
+    if (rmb == glfw.c.GLFW_PRESS) {
+        const raw = glfw.getCursorPos(window); // struct { x: f64, y: f64 }
+        const pos = [2]f64{ raw.x, raw.y };
+
+        if (CursorState.last_pos) |prev| {
+            const dx = pos[0] - prev[0];
+            const dy = pos[1] - prev[1];
+
+            ci.look_delta_x = @as(f32, @floatCast(dx));
+            ci.look_delta_y = @as(f32, @floatCast(dy));
+        }
+
+        CursorState.last_pos = pos;
+    } else {
+        CursorState.last_pos = null;
+    }
+
+    return ci;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -142,15 +166,14 @@ pub fn main() !void {
     defer glfw.terminate();
 
     var extent = vk.Extent2D{
-        .width = 1280,
-        .height = 720,
+        .width = 800,
+        .height = 600,
     };
 
     // ── Vulkan window setup: no client API (no OpenGL), Vulkan-only.
     glfw.defaultWindowHints();
     glfw.windowHint(glfw.c.GLFW_CLIENT_API, glfw.c.GLFW_NO_API);
 
-    // Create window with no client API (Vulkan-only).
     const window = glfw.createWindow(
         @as(i32, @intCast(extent.width)),
         @as(i32, @intCast(extent.height)),
@@ -227,7 +250,7 @@ pub fn main() !void {
     defer gc.vkd.freeMemory(gc.dev, memory, null);
     try gc.vkd.bindBufferMemory(gc.dev, buffer, memory, 0);
 
-    // Persistent staging buffer (host-visible) used to update the geometry each frame.
+    // Persistent staging buffer (host-visible) used to update geometry each frame.
     const staging_buffer = try gc.vkd.createBuffer(gc.dev, &.{
         .flags = .{},
         .size = VERTEX_BUFFER_SIZE,
@@ -262,15 +285,17 @@ pub fn main() !void {
     // Camera + frame timer
     // ─────────────────────────────────────────────────────────────────────
 
-    const pi_f32: f32 = @floatCast(std.math.pi);
-    const initial_aspect: f32 =
+    const aspect: f32 =
         @as(f32, @floatFromInt(extent.width)) /
         @as(f32, @floatFromInt(extent.height));
 
+    // 60 degrees FOV in radians.
+    const fov_y: f32 = @as(f32, @floatCast(std.math.pi)) / 3.0;
+
     var camera = Camera3D.init(
         Vec3.init(0.0, 1.5, 5.0),
-        pi_f32 / 3.0, // 60 degrees
-        initial_aspect,
+        fov_y,
+        aspect,
         0.1,
         100.0,
     );
@@ -279,19 +304,13 @@ pub fn main() !void {
 
     // Prime the vertex buffer once so we don't start with garbage.
     {
-        try updateSceneVertices(&gc, staging_memory, &camera);
+        try updateWorldVertices(&gc, staging_memory, &camera);
         try copyBuffer(&gc, pool, buffer, staging_buffer, VERTEX_BUFFER_SIZE);
     }
 
     while (!glfw.windowShouldClose(window)) {
         const tick = frame_timer.tick(nowMsFromGlfw());
         const dt = @as(f32, @floatCast(tick.dt));
-
-        // ESC to quit
-        const esc_state = glfw.getKey(window, glfw.c.GLFW_KEY_ESCAPE);
-        if (esc_state == glfw.c.GLFW_PRESS or esc_state == glfw.c.GLFW_REPEAT) {
-            glfw.setWindowShouldClose(window, true);
-        }
 
         if (tick.fps_updated) {
             std.log.info(
@@ -301,11 +320,18 @@ pub fn main() !void {
             updateWindowTitle(window, tick.fps, &camera);
         }
 
+        // ESC to quit.
+        const esc = glfw.getKey(window, glfw.c.GLFW_KEY_ESCAPE);
+        if (esc == glfw.c.GLFW_PRESS or esc == glfw.c.GLFW_REPEAT) {
+            glfw.setWindowShouldClose(window, true);
+        }
+
+        // Sample input + update camera.
         const cam_input = sampleCameraInput(window);
         camera.update(dt, cam_input);
 
-        // Rebuild world → NDC vertices into staging, then copy to device-local buffer.
-        try updateSceneVertices(&gc, staging_memory, &camera);
+        // Rebuild world → clip-space vertices into staging, then copy to device-local buffer.
+        try updateWorldVertices(&gc, staging_memory, &camera);
         try copyBuffer(&gc, pool, buffer, staging_buffer, VERTEX_BUFFER_SIZE);
 
         const cmdbuf = cmdbufs[swapchain.image_index];
@@ -329,10 +355,10 @@ pub fn main() !void {
 
             try swapchain.recreate(extent);
 
+            // Keep camera projection in sync with new swapchain size.
             const new_aspect: f32 =
                 @as(f32, @floatFromInt(extent.width)) /
                 @as(f32, @floatFromInt(extent.height));
-
             camera.setAspect(new_aspect);
 
             destroyFramebuffers(&gc, allocator, framebuffers);
@@ -358,70 +384,10 @@ pub fn main() !void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Camera input sampling (WASD + Space/Ctrl + RMB look)
+// Geometry update: Camera → Vertex buffer
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn sampleCameraInput(window: *glfw.Window) CameraInput {
-    var ci: CameraInput = .{};
-
-    // Movement: WASD + Space/Ctrl
-    const w_state = glfw.getKey(window, glfw.c.GLFW_KEY_W);
-    const s_state = glfw.getKey(window, glfw.c.GLFW_KEY_S);
-    const a_state = glfw.getKey(window, glfw.c.GLFW_KEY_A);
-    const d_state = glfw.getKey(window, glfw.c.GLFW_KEY_D);
-    const space_state = glfw.getKey(window, glfw.c.GLFW_KEY_SPACE);
-    const ctrl_state = glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_CONTROL);
-
-    if (w_state == glfw.c.GLFW_PRESS or w_state == glfw.c.GLFW_REPEAT) {
-        ci.move_forward = true;
-    }
-    if (s_state == glfw.c.GLFW_PRESS or s_state == glfw.c.GLFW_REPEAT) {
-        ci.move_backward = true;
-    }
-    if (a_state == glfw.c.GLFW_PRESS or a_state == glfw.c.GLFW_REPEAT) {
-        ci.move_left = true;
-    }
-    if (d_state == glfw.c.GLFW_PRESS or d_state == glfw.c.GLFW_REPEAT) {
-        ci.move_right = true;
-    }
-    if (space_state == glfw.c.GLFW_PRESS or space_state == glfw.c.GLFW_REPEAT) {
-        ci.move_up = true;
-    }
-    if (ctrl_state == glfw.c.GLFW_PRESS or ctrl_state == glfw.c.GLFW_REPEAT) {
-        ci.move_down = true;
-    }
-
-    // RMB drag → look (yaw/pitch)
-    const rmb = glfw.getMouseButton(window, glfw.c.GLFW_MOUSE_BUTTON_RIGHT);
-
-    const State = struct {
-        var last_pos: ?struct { x: f64, y: f64 } = null;
-    };
-
-    if (rmb == glfw.c.GLFW_PRESS) {
-        const pos = glfw.getCursorPos(window);
-
-        if (State.last_pos) |last| {
-            const dx = pos.x - last.x;
-            const dy = pos.y - last.y;
-
-            ci.look_delta_x = @as(f32, @floatCast(dx));
-            ci.look_delta_y = @as(f32, @floatCast(dy));
-        }
-
-        State.last_pos = .{ .x = pos.x, .y = pos.y };
-    } else {
-        State.last_pos = null;
-    }
-
-    return ci;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Geometry update: Scene → Vertex buffer (CPU-side view-projection)
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn updateSceneVertices(
+fn updateWorldVertices(
     gc: *const GraphicsContext,
     staging_memory: vk.DeviceMemory,
     camera: *const Camera3D,
@@ -433,18 +399,39 @@ fn updateSceneVertices(
 
     const view_proj = camera.viewProjMatrix();
 
-    for (scene_vertices, 0..) |sv, i| {
-        // Convert [3]f32 → Vec3 for mulPoint3
-        const world = Vec3.init(sv.pos[0], sv.pos[1], sv.pos[2]);
-        const projected = view_proj.mulPoint3(world); // Vec3 in NDC (after perspective divide)
+    // Static world positions for now; later we can hook a real Game here.
+    const hero_world = Vec3.init(0.0, 0.0, 0.0);
+    const enemy_world = Vec3.init(1.5, 0.3, -2.0);
 
-        const ndc = [3]f32{ projected.x, projected.y, projected.z };
+    var idx: usize = 0;
 
-        gpu_vertices[i] = .{
-            .pos = ndc,
-            .color = sv.color,
+    // Hero
+    for (hero_template) |v| {
+        const local = Vec3.init(v.pos[0], v.pos[1], v.pos[2]);
+        const world = hero_world.add(local);
+        const clip = view_proj.mulPoint3(world);
+
+        gpu_vertices[idx] = .{
+            .pos = .{ clip.x, clip.y, clip.z },
+            .color = v.color,
         };
+        idx += 1;
     }
+
+    // Enemy
+    for (enemy_template) |v| {
+        const local = Vec3.init(v.pos[0], v.pos[1], v.pos[2]);
+        const world = enemy_world.add(local);
+        const clip = view_proj.mulPoint3(world);
+
+        gpu_vertices[idx] = .{
+            .pos = .{ clip.x, clip.y, clip.z },
+            .color = v.color,
+        };
+        idx += 1;
+    }
+
+    std.debug.assert(idx == TOTAL_VERTICES);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -755,8 +742,7 @@ fn createPipeline(
         .depth_clamp_enable = VK_FALSE32,
         .rasterizer_discard_enable = VK_FALSE32,
         .polygon_mode = .fill,
-        // IMPORTANT: disable culling for now so we see everything
-        .cull_mode = .{}, // no bits set → no culling
+        .cull_mode = .{ .back_bit = true },
         .front_face = .clockwise,
         .depth_bias_enable = VK_FALSE32,
         .depth_bias_constant_factor = 0,

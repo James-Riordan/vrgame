@@ -7,6 +7,5 @@ layout(location = 0) out vec3 v_color;
 
 void main() {
     v_color = in_color;
-    // Positions coming from CPU are already in NDC space.
     gl_Position = vec4(in_pos, 1.0);
 }
