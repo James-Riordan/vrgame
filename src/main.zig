@@ -7,7 +7,9 @@ const Swapchain = @import("swapchain").Swapchain;
 const Vertex = @import("vertex").Vertex;
 const FrameTimer = @import("frame_time").FrameTimer;
 
-const vr = @import("vrgame"); // facade/root module for vrgame
+const game = @import("game");
+const Game = game.Game;
+const InputState = game.InputState;
 
 const triangle_vert = @embedFile("triangle_vert");
 const triangle_frag = @embedFile("triangle_frag");
@@ -22,52 +24,6 @@ const app_name = "VRGame — Zigadel Prototype";
 
 // NUL-terminated window title for GLFW.
 const window_title: [:0]const u8 = "VRGame — Zigadel Prototype";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Minimal "game core" for the demo
-// ─────────────────────────────────────────────────────────────────────────────
-
-const InputState = struct {
-    move_forward: bool = false,
-    move_backward: bool = false,
-    move_left: bool = false,
-    move_right: bool = false,
-    quit: bool = false,
-};
-
-const Game = struct {
-    // For now this is just a placeholder player position in 2D.
-    // Later this will become a full hero/ability state machine.
-    player_x: f32,
-    player_y: f32,
-
-    pub fn init() Game {
-        return .{
-            .player_x = 0.0,
-            .player_y = 0.0,
-        };
-    }
-
-    pub fn update(self: *Game, dt: f32, input: InputState) void {
-        const move_speed: f32 = 3.5; // units per second (arbitrary units for now)
-
-        if (input.move_forward) self.player_y += move_speed * dt;
-        if (input.move_backward) self.player_y -= move_speed * dt;
-        if (input.move_left) self.player_x -= move_speed * dt;
-        if (input.move_right) self.player_x += move_speed * dt;
-
-        // Later this will drive camera, hero, projectiles, etc.
-        // _ = self;
-        // _ = dt;
-    }
-};
-
-// Simple demo triangle.
-const vertices = [_]Vertex{
-    .{ .pos = .{ 0, -0.5 }, .color = .{ 1, 0, 0 } },
-    .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0, 1, 0 } },
-    .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0, 0, 1 } },
-};
 
 /// GLFW error callback: logs code + description.
 fn errorCallback(code: c_int, description: [*c]const u8) callconv(.c) void {
@@ -202,28 +158,30 @@ pub fn main() !void {
     defer destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
 
     // ─────────────────────────────────────────────────────────────────────
-    // Game state + frame timer + main loop
+    // Game state + timing
     // ─────────────────────────────────────────────────────────────────────
 
     var game_state = Game.init();
 
-    // Initialize frame timer from current GLFW time (in milliseconds),
-    // using a 1000 ms sample window for FPS.
-    const start_ms: i64 = @as(i64, @intFromFloat(glfw.getTime() * 1000.0));
-    var frame_timer = FrameTimer.init(start_ms, 1000);
+    // FrameTimer uses millisecond timestamps; glfw.getTime() is seconds.
+    const start_ms_f64 = glfw.getTime() * 1000.0;
+    const start_ms: i64 = @intFromFloat(start_ms_f64);
+    var frame_timer = FrameTimer.init(start_ms, 1000); // 1s FPS sample window.
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Main loop
+    // ─────────────────────────────────────────────────────────────────────
 
     while (!glfw.windowShouldClose(window)) {
-        // Convert GLFW time (seconds) → milliseconds.
-        const now_ms: i64 = @as(i64, @intFromFloat(glfw.getTime() * 1000.0));
-        const tick_res = frame_timer.tick(now_ms);
+        const now_ms: i64 = @intFromFloat(glfw.getTime() * 1000.0);
+        const tick = frame_timer.tick(now_ms);
 
-        // If dt is 0, either time didn't advance or went backwards; just poll events.
-        if (tick_res.dt <= 0.0) {
-            glfw.pollEvents();
-            continue;
+        // `tick.dt` is in seconds.
+        const dt: f32 = @floatCast(tick.dt);
+
+        if (tick.fps_updated) {
+            std.log.info("FPS: {d:.2}", .{tick.fps});
         }
-
-        const dt: f32 = @floatCast(tick_res.dt);
 
         const input = sampleInput(window);
         if (input.quit) {
@@ -232,11 +190,6 @@ pub fn main() !void {
         }
 
         game_state.update(dt, input);
-
-        // Optional: log FPS when a sample window completes.
-        if (tick_res.fps_updated) {
-            std.log.info("FPS: {d:.2}", .{tick_res.fps});
-        }
 
         const cmdbuf = cmdbufs[swapchain.image_index];
 
@@ -282,7 +235,7 @@ pub fn main() !void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Input sampling
+// Input sampling (GLFW → abstract InputState)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn sampleInput(window: *glfw.Window) InputState {
@@ -319,6 +272,13 @@ fn sampleInput(window: *glfw.Window) InputState {
 // ─────────────────────────────────────────────────────────────────────────────
 // Upload vertices
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Simple demo triangle.
+const vertices = [_]Vertex{
+    .{ .pos = .{ 0, -0.5 }, .color = .{ 1, 0, 0 } },
+    .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0, 1, 0 } },
+    .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0, 0, 1 } },
+};
 
 fn uploadVertices(gc: *const GraphicsContext, pool: vk.CommandPool, buffer: vk.Buffer) !void {
     const staging_buffer = try gc.vkd.createBuffer(gc.dev, &.{
@@ -742,25 +702,10 @@ fn createPipeline(
     return pipeline;
 }
 
-test "Game basic movement with WASD-style input" {
-    var game = Game.init();
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
 
-    // No movement when no input.
-    game.update(1.0, .{});
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), game.player_x, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), game.player_y, 0.0001);
-
-    // Move forward for 1 second.
-    game.update(1.0, .{ .move_forward = true });
-    try std.testing.expect(game.player_y > 0.0);
-
-    const y_after_forward = game.player_y;
-
-    // Move backward for 0.5 seconds; should reduce y a bit.
-    game.update(0.5, .{ .move_backward = true });
-    try std.testing.expect(game.player_y < y_after_forward);
-
-    // Move right for 2 seconds; x should increase.
-    game.update(2.0, .{ .move_right = true });
-    try std.testing.expect(game.player_x > 0.0);
+test "refAllDecls (main module)" {
+    std.testing.refAllDecls(@This());
 }
