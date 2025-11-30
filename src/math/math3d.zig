@@ -207,6 +207,60 @@ pub const Mat4 = struct {
 
         return res;
     }
+
+    /// Transform a 3D point by this matrix, treating it as (x, y, z, 1),
+    /// then divide by w to return NDC-ish coordinates.
+    pub fn mulPoint3(self: Mat4, v: Vec3) Vec3 {
+        const m = self.m;
+        const x = v.x;
+        const y = v.y;
+        const z = v.z;
+
+        // Column-major layout:
+        // [ 0  4  8 12 ]
+        // [ 1  5  9 13 ]
+        // [ 2  6 10 14 ]
+        // [ 3  7 11 15 ]
+        const clip_x = m[0] * x + m[4] * y + m[8] * z + m[12];
+        const clip_y = m[1] * x + m[5] * y + m[9] * z + m[13];
+        const clip_z = m[2] * x + m[6] * y + m[10] * z + m[14];
+        const clip_w = m[3] * x + m[7] * y + m[11] * z + m[15];
+
+        if (clip_w != 0.0) {
+            const inv_w = 1.0 / clip_w;
+            return Vec3.init(
+                clip_x * inv_w,
+                clip_y * inv_w,
+                clip_z * inv_w,
+            );
+        } else {
+            // Degenerate case; just return without perspective divide.
+            return Vec3.init(clip_x, clip_y, clip_z);
+        }
+    }
+
+    /// Transform a point (Vec3) by this matrix and return NDC coordinates.
+    /// Assumes column-major storage and v' = M * vec4(x, y, z, 1).
+    pub fn mulPoint(self: Mat4, v: Vec3) Vec3 {
+        const x = v.x;
+        const y = v.y;
+        const z = v.z;
+
+        // Column-major: m[col*4 + row]
+        const m = self.m;
+
+        const rx = m[0] * x + m[4] * y + m[8] * z + m[12] * 1.0;
+        const ry = m[1] * x + m[5] * y + m[9] * z + m[13] * 1.0;
+        const rz = m[2] * x + m[6] * y + m[10] * z + m[14] * 1.0;
+        const rw = m[3] * x + m[7] * y + m[11] * z + m[15] * 1.0;
+
+        if (rw != 0.0) {
+            const inv_w = 1.0 / rw;
+            return Vec3.init(rx * inv_w, ry * inv_w, rz * inv_w);
+        } else {
+            return Vec3.init(rx, ry, rz);
+        }
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
