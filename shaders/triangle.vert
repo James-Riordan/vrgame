@@ -2,11 +2,8 @@
 
 layout(location = 0) in vec3 in_pos;
 layout(location = 1) in vec3 in_color;
-
 layout(location = 0) out vec3 v_color;
 
-// CPU already does world → viewProj → clip-space (NDC * w).
-// We just pass the position through.
 void main() {
     v_color = in_color;
     gl_Position = vec4(in_pos, 1.0);

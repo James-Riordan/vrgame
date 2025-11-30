@@ -9,15 +9,10 @@ const Vertex = @import("vertex").Vertex;
 const frame_time = @import("frame_time");
 const FrameTimer = frame_time.FrameTimer;
 
-const game = @import("game");
-const InputState = game.InputState;
-const Game = game.Game;
-
 const camera3d = @import("camera3d");
 const Camera3D = camera3d.Camera3D;
 const CameraInput = camera3d.CameraInput;
 
-// 3D math module used by Camera3D and for CPU-side transforms.
 const math3d = @import("math3d");
 const Vec3 = math3d.Vec3;
 const Mat4 = math3d.Mat4;
@@ -37,11 +32,8 @@ const app_name = "VRGame — Zigadel Prototype";
 const window_title: [:0]const u8 = "VRGame — Zigadel Prototype";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Hero / enemy geometry templates (local offsets in world units)
+// Simple 3D geometry: two triangle markers + ground plane
 // ─────────────────────────────────────────────────────────────────────────────
-//
-// These are small triangles in local space. We position them in world-space
-// based on the Game's hero/enemy positions, then transform via Camera3D.
 
 const hero_template = [_]Vertex{
     .{ .pos = .{ 0.0, 0.20, 0.0 }, .color = .{ 0.9, 0.9, 0.9 } }, // tip
@@ -55,8 +47,8 @@ const enemy_template = [_]Vertex{
     .{ .pos = .{ 0.14, -0.14, 0.0 }, .color = .{ 0.8, 0.2, 0.2 } },
 };
 
-// Simple ground quad made of two triangles in XZ plane at y = -1.
-// This will *visibly* show perspective when you move/fly the camera.
+// Ground quad (two triangles) in XZ plane at y = -1.
+// Big enough that you really feel perspective when moving the camera.
 const ground_template = [_]Vertex{
     // Triangle 1
     .{ .pos = .{ -10.0, -1.0, -10.0 }, .color = .{ 0.15, 0.45, 0.15 } },
@@ -81,14 +73,14 @@ const VERTEX_BUFFER_SIZE: vk.DeviceSize =
 // Utility
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn updateWindowTitle(window: *glfw.Window, fps: f64, g: *const Game) void {
+fn updateWindowTitle(window: *glfw.Window, fps: f64, cam: *const Camera3D) void {
     // Small fixed buffer for the title; avoid heap allocation.
-    var buf: [160]u8 = undefined;
+    var buf: [200]u8 = undefined;
 
     const title = std.fmt.bufPrintZ(
         &buf,
-        "VRGame — Zigadel Prototype | FPS: {d:.1} | Hero: x={d:.2}, y={d:.2} | Score: {d}",
-        .{ fps, g.player_x, g.player_y, g.score },
+        "VRGame — Zigadel Prototype | FPS: {d:.1} | Cam: x={d:.2}, y={d:.2}, z={d:.2}",
+        .{ fps, cam.position.x, cam.position.y, cam.position.z },
     ) catch {
         // Fallback to the static title if formatting fails for any reason.
         glfw.setWindowTitle(window, window_title);
@@ -119,56 +111,288 @@ fn errorCallback(code: c_int, description: [*c]const u8) callconv(.c) void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Input sampling
+// Main
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Game input: for now, only ESC to quit. Movement is handled by CameraInput.
-fn sampleInput(window: *glfw.Window) InputState {
-    var state: InputState = .{};
+pub fn main() !void {
+    // Install error callback first, so even init() failures are logged.
+    _ = glfw.setErrorCallback(errorCallback);
 
-    const esc_state = glfw.getKey(window, glfw.c.GLFW_KEY_ESCAPE);
-    if (esc_state == glfw.c.GLFW_PRESS or esc_state == glfw.c.GLFW_REPEAT) {
-        state.quit = true;
+    // Initialize GLFW
+    glfw.init() catch {
+        if (glfw.getLastError()) |err_info| {
+            const code_opt = glfw.errorCodeFromC(err_info.code);
+            const code_str = if (code_opt) |ce| @tagName(ce) else "UnknownError";
+            const desc_str: []const u8 = err_info.description orelse "no description";
+
+            std.log.err(
+                "failed to initialize GLFW: {s}: {s}",
+                .{ code_str, desc_str },
+            );
+        } else {
+            std.log.err("failed to initialize GLFW (no error info)", .{});
+        }
+        return error.GlfwInitFailed;
+    };
+    defer glfw.terminate();
+
+    var extent = vk.Extent2D{
+        .width = 800,
+        .height = 600,
+    };
+
+    // ── Vulkan window setup: no client API (no OpenGL), Vulkan-only.
+    glfw.defaultWindowHints();
+    glfw.windowHint(glfw.c.GLFW_CLIENT_API, glfw.c.GLFW_NO_API);
+
+    // Create window with no client API (Vulkan-only).
+    const window = glfw.createWindow(
+        @as(i32, @intCast(extent.width)),
+        @as(i32, @intCast(extent.height)),
+        window_title,
+        null,
+        null,
+    ) catch {
+        if (glfw.getLastError()) |err_info| {
+            const code_opt = glfw.errorCodeFromC(err_info.code);
+            const code_str = if (code_opt) |ce| @tagName(ce) else "UnknownError";
+            const desc_str: []const u8 = err_info.description orelse "no description";
+
+            std.log.err(
+                "failed to create GLFW window: {s}: {s}",
+                .{ code_str, desc_str },
+            );
+        } else {
+            std.log.err("failed to create GLFW window (no error info)", .{});
+        }
+        return error.CreateWindowFailed;
+    };
+    defer glfw.destroyWindow(window);
+
+    const allocator = std.heap.page_allocator;
+
+    const gc = try GraphicsContext.init(allocator, app_name, window);
+    defer gc.deinit();
+
+    std.debug.print("Using device: {s}\n", .{gc.deviceName()});
+
+    var swapchain = try Swapchain.init(&gc, allocator, extent);
+    defer swapchain.deinit();
+
+    const pipeline_layout = try gc.vkd.createPipelineLayout(gc.dev, &.{
+        .flags = .{},
+        .set_layout_count = 0,
+        .p_set_layouts = undefined,
+        .push_constant_range_count = 0,
+        .p_push_constant_ranges = undefined,
+    }, null);
+    defer gc.vkd.destroyPipelineLayout(gc.dev, pipeline_layout, null);
+
+    const render_pass = try createRenderPass(&gc, swapchain);
+    defer gc.vkd.destroyRenderPass(gc.dev, render_pass, null);
+
+    const pipeline = try createPipeline(&gc, pipeline_layout, render_pass);
+    defer gc.vkd.destroyPipeline(gc.dev, pipeline, null);
+
+    var framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain);
+    defer destroyFramebuffers(&gc, allocator, framebuffers);
+
+    const pool = try gc.vkd.createCommandPool(gc.dev, &.{
+        .flags = .{},
+        .queue_family_index = gc.graphics_queue.family,
+    }, null);
+    defer gc.vkd.destroyCommandPool(gc.dev, pool, null);
+
+    // GPU vertex buffer (device-local).
+    const buffer = try gc.vkd.createBuffer(gc.dev, &.{
+        .flags = .{},
+        .size = VERTEX_BUFFER_SIZE,
+        .usage = .{
+            .transfer_dst_bit = true,
+            .vertex_buffer_bit = true,
+        },
+        .sharing_mode = .exclusive,
+        .queue_family_index_count = 0,
+        .p_queue_family_indices = undefined,
+    }, null);
+    defer gc.vkd.destroyBuffer(gc.dev, buffer, null);
+
+    const mem_reqs = gc.vkd.getBufferMemoryRequirements(gc.dev, buffer);
+    const memory = try gc.allocate(mem_reqs, .{ .device_local_bit = true });
+    defer gc.vkd.freeMemory(gc.dev, memory, null);
+    try gc.vkd.bindBufferMemory(gc.dev, buffer, memory, 0);
+
+    // Persistent staging buffer (host-visible) used to update the geometry each frame.
+    const staging_buffer = try gc.vkd.createBuffer(gc.dev, &.{
+        .flags = .{},
+        .size = VERTEX_BUFFER_SIZE,
+        .usage = .{ .transfer_src_bit = true },
+        .sharing_mode = .exclusive,
+        .queue_family_index_count = 0,
+        .p_queue_family_indices = undefined,
+    }, null);
+    defer gc.vkd.destroyBuffer(gc.dev, staging_buffer, null);
+
+    const staging_reqs = gc.vkd.getBufferMemoryRequirements(gc.dev, staging_buffer);
+    const staging_memory = try gc.allocate(staging_reqs, .{
+        .host_visible_bit = true,
+        .host_coherent_bit = true,
+    });
+    defer gc.vkd.freeMemory(gc.dev, staging_memory, null);
+    try gc.vkd.bindBufferMemory(gc.dev, staging_buffer, staging_memory, 0);
+
+    var cmdbufs = try createCommandBuffers(
+        &gc,
+        pool,
+        allocator,
+        buffer,
+        swapchain.extent,
+        render_pass,
+        pipeline,
+        framebuffers,
+    );
+    defer destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Camera + frame timer
+    // ─────────────────────────────────────────────────────────────────────
+
+    const fov_y: f32 = @as(f32, @floatCast(std.math.pi)) / 3.0; // 60°
+    var camera = Camera3D.init(
+        Vec3.init(0.0, 1.5, 5.0),
+        fov_y,
+        @as(f32, @floatFromInt(extent.width)) /
+            @as(f32, @floatFromInt(extent.height)),
+        0.1,
+        100.0,
+    );
+    // Slight downward tilt so we see the ground.
+    camera.pitch = -0.25;
+
+    var frame_timer = FrameTimer.init(nowMsFromGlfw(), 1000); // 1s FPS window.
+
+    // Prime the vertex buffer once so we don't start with garbage.
+    {
+        try updateWorldVertices(&gc, staging_memory, &camera);
+        try copyBuffer(&gc, pool, buffer, staging_buffer, VERTEX_BUFFER_SIZE);
     }
 
-    return state;
+    while (!glfw.windowShouldClose(window)) {
+        const tick = frame_timer.tick(nowMsFromGlfw());
+        const dt = @as(f32, @floatCast(tick.dt));
+
+        if (tick.fps_updated) {
+            std.log.info(
+                "FPS: {d:.2} | Cam=({d:.2}, {d:.2}, {d:.2})",
+                .{ tick.fps, camera.position.x, camera.position.y, camera.position.z },
+            );
+            updateWindowTitle(window, tick.fps, &camera);
+        }
+
+        // Camera input: keyboard movement + RMB look.
+        const cam_input = sampleCameraInput(window);
+        camera.update(dt, cam_input);
+
+        // ESC to quit
+        const esc_state = glfw.getKey(window, glfw.c.GLFW_KEY_ESCAPE);
+        if (esc_state == glfw.c.GLFW_PRESS or esc_state == glfw.c.GLFW_REPEAT) {
+            glfw.setWindowShouldClose(window, true);
+        }
+
+        // Rebuild world → viewProj → NDC vertices into staging, then copy to device-local buffer.
+        try updateWorldVertices(&gc, staging_memory, &camera);
+        try copyBuffer(&gc, pool, buffer, staging_buffer, VERTEX_BUFFER_SIZE);
+
+        const cmdbuf = cmdbufs[swapchain.image_index];
+
+        const state = swapchain.present(cmdbuf) catch |err| switch (err) {
+            error.OutOfDateKHR => Swapchain.PresentState.suboptimal,
+            else => |narrow| return narrow,
+        };
+
+        if (state == .suboptimal) {
+            const size = glfw.getWindowSize(window);
+
+            // Handle minimized / zero-size window safely.
+            if (size.width == 0 or size.height == 0) {
+                glfw.pollEvents();
+                continue;
+            }
+
+            extent.width = @intCast(size.width);
+            extent.height = @intCast(size.height);
+
+            try swapchain.recreate(extent);
+
+            // Keep camera projection in sync with new swapchain size.
+            camera.setAspect(
+                @as(f32, @floatFromInt(extent.width)) /
+                    @as(f32, @floatFromInt(extent.height)),
+            );
+
+            destroyFramebuffers(&gc, allocator, framebuffers);
+            framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain);
+
+            destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
+            cmdbufs = try createCommandBuffers(
+                &gc,
+                pool,
+                allocator,
+                buffer,
+                swapchain.extent,
+                render_pass,
+                pipeline,
+                framebuffers,
+            );
+        }
+
+        glfw.pollEvents();
+    }
+
+    try swapchain.waitForAllFences();
 }
 
-/// Camera input: WASD + Space/Ctrl for movement, RMB drag for look.
+// ─────────────────────────────────────────────────────────────────────────────
+// Input sampling (camera only)
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn sampleCameraInput(window: *glfw.Window) CameraInput {
     var ci: CameraInput = .{};
 
-    // Movement: WASD
+    // Movement: WASD + Space/Ctrl.
     const w_state = glfw.getKey(window, glfw.c.GLFW_KEY_W);
     const s_state = glfw.getKey(window, glfw.c.GLFW_KEY_S);
     const a_state = glfw.getKey(window, glfw.c.GLFW_KEY_A);
     const d_state = glfw.getKey(window, glfw.c.GLFW_KEY_D);
-
-    if (w_state == glfw.c.GLFW_PRESS or w_state == glfw.c.GLFW_REPEAT) ci.move_forward = true;
-    if (s_state == glfw.c.GLFW_PRESS or s_state == glfw.c.GLFW_REPEAT) ci.move_backward = true;
-    if (a_state == glfw.c.GLFW_PRESS or a_state == glfw.c.GLFW_REPEAT) ci.move_left = true;
-    if (d_state == glfw.c.GLFW_PRESS or d_state == glfw.c.GLFW_REPEAT) ci.move_right = true;
-
-    // Vertical movement: Space (up), Left Ctrl (down)
     const space_state = glfw.getKey(window, glfw.c.GLFW_KEY_SPACE);
     const ctrl_state = glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_CONTROL);
 
-    if (space_state == glfw.c.GLFW_PRESS or space_state == glfw.c.GLFW_REPEAT) ci.move_up = true;
-    if (ctrl_state == glfw.c.GLFW_PRESS or ctrl_state == glfw.c.GLFW_REPEAT) ci.move_down = true;
+    if (w_state == glfw.c.GLFW_PRESS or w_state == glfw.c.GLFW_REPEAT)
+        ci.move_forward = true;
+    if (s_state == glfw.c.GLFW_PRESS or s_state == glfw.c.GLFW_REPEAT)
+        ci.move_backward = true;
+    if (a_state == glfw.c.GLFW_PRESS or a_state == glfw.c.GLFW_REPEAT)
+        ci.move_left = true;
+    if (d_state == glfw.c.GLFW_PRESS or d_state == glfw.c.GLFW_REPEAT)
+        ci.move_right = true;
+    if (space_state == glfw.c.GLFW_PRESS or space_state == glfw.c.GLFW_REPEAT)
+        ci.move_up = true;
+    if (ctrl_state == glfw.c.GLFW_PRESS or ctrl_state == glfw.c.GLFW_REPEAT)
+        ci.move_down = true;
 
-    // Mouse look: right mouse button drag.
+    // Mouse look: hold right mouse button to rotate.
     const rmb = glfw.getMouseButton(window, glfw.c.GLFW_MOUSE_BUTTON_RIGHT);
 
     const State = struct {
-        var last_x: f64 = 0.0;
-        var last_y: f64 = 0.0;
-        var has_last: bool = false;
+        var last_x: f64 = 0;
+        var last_y: f64 = 0;
+        var have_last: bool = false;
     };
 
     if (rmb == glfw.c.GLFW_PRESS) {
         const pos = glfw.getCursorPos(window);
 
-        if (State.has_last) {
+        if (State.have_last) {
             const dx = pos.x - State.last_x;
             const dy = pos.y - State.last_y;
 
@@ -178,22 +402,21 @@ fn sampleCameraInput(window: *glfw.Window) CameraInput {
 
         State.last_x = pos.x;
         State.last_y = pos.y;
-        State.has_last = true;
+        State.have_last = true;
     } else {
-        State.has_last = false;
+        State.have_last = false;
     }
 
     return ci;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Geometry update: Game + Camera3D → Vertex buffer
+// Geometry update: Camera → Vertex buffer
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn updateWorldVertices(
     gc: *const GraphicsContext,
     staging_memory: vk.DeviceMemory,
-    g: *const Game,
     camera: *const Camera3D,
 ) !void {
     const data = try gc.vkd.mapMemory(gc.dev, staging_memory, 0, vk.WHOLE_SIZE, .{});
@@ -203,56 +426,45 @@ fn updateWorldVertices(
 
     const view_proj: Mat4 = camera.viewProjMatrix();
 
-    const hero_xy = g.heroPosition();
-    const enemy_xy = g.enemyPosition();
-
-    const hero_origin = Vec3.init(hero_xy[0], hero_xy[1], 0.0);
-    const enemy_origin = Vec3.init(enemy_xy[0], enemy_xy[1], 0.0);
+    // Static world anchors for the two triangle markers.
+    const hero_origin = Vec3.init(0.0, 0.0, 0.0);
+    const enemy_origin = Vec3.init(1.5, 0.2, -3.0);
 
     var idx: usize = 0;
 
-    // ── Hero (no flash) ──────────────────────────────────────────────────
+    // ── Hero marker ──────────────────────────────────────────────────────
     for (hero_template) |v| {
         const local = Vec3.init(v.pos[0], v.pos[1], v.pos[2]);
         const world = hero_origin.add(local);
-        const clip = view_proj.mulPoint3(world);
+        const ndc = view_proj.mulPoint3(world);
 
         gpu_vertices[idx] = .{
-            .pos = .{ clip.x, clip.y, clip.z },
+            .pos = .{ ndc.x, ndc.y, ndc.z },
             .color = v.color,
         };
         idx += 1;
     }
 
-    // ── Enemy (flash white when recently hit) ────────────────────────────
-    const flash = g.hitFlashIntensity();
-    const inv_flash = 1.0 - flash;
-    const flash_color = [_]f32{ 1.0, 1.0, 1.0 };
-
+    // ── Enemy marker ─────────────────────────────────────────────────────
     for (enemy_template) |v| {
         const local = Vec3.init(v.pos[0], v.pos[1], v.pos[2]);
         const world = enemy_origin.add(local);
-        const clip = view_proj.mulPoint3(world);
+        const ndc = view_proj.mulPoint3(world);
 
-        const c = v.color;
         gpu_vertices[idx] = .{
-            .pos = .{ clip.x, clip.y, clip.z },
-            .color = .{
-                c[0] * inv_flash + flash_color[0] * flash,
-                c[1] * inv_flash + flash_color[1] * flash,
-                c[2] * inv_flash + flash_color[2] * flash,
-            },
+            .pos = .{ ndc.x, ndc.y, ndc.z },
+            .color = v.color,
         };
         idx += 1;
     }
 
-    // ── Ground (static world geometry) ───────────────────────────────────
+    // ── Ground plane ─────────────────────────────────────────────────────
     for (ground_template) |v| {
         const world = Vec3.init(v.pos[0], v.pos[1], v.pos[2]);
-        const clip = view_proj.mulPoint3(world);
+        const ndc = view_proj.mulPoint3(world);
 
         gpu_vertices[idx] = .{
-            .pos = .{ clip.x, clip.y, clip.z },
+            .pos = .{ ndc.x, ndc.y, ndc.z },
             .color = v.color,
         };
         idx += 1;
@@ -651,252 +863,4 @@ fn createPipeline(
         @as([*]vk.Pipeline, @ptrCast(&pipeline)),
     );
     return pipeline;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────────────────────────────────────
-
-pub fn main() !void {
-    // Install error callback first, so even init() failures are logged.
-    _ = glfw.setErrorCallback(errorCallback);
-
-    // Initialize GLFW
-    glfw.init() catch {
-        if (glfw.getLastError()) |err_info| {
-            const code_opt = glfw.errorCodeFromC(err_info.code);
-            const code_str = if (code_opt) |ce| @tagName(ce) else "UnknownError";
-            const desc_str: []const u8 = err_info.description orelse "no description";
-
-            std.log.err(
-                "failed to initialize GLFW: {s}: {s}",
-                .{ code_str, desc_str },
-            );
-        } else {
-            std.log.err("failed to initialize GLFW (no error info)", .{});
-        }
-        return error.GlfwInitFailed;
-    };
-    defer glfw.terminate();
-
-    var extent = vk.Extent2D{
-        .width = 800,
-        .height = 600,
-    };
-
-    // ── Vulkan window setup: no client API (no OpenGL), Vulkan-only.
-    glfw.defaultWindowHints();
-    glfw.windowHint(glfw.c.GLFW_CLIENT_API, glfw.c.GLFW_NO_API);
-
-    // Create window with no client API (Vulkan-only).
-    const window = glfw.createWindow(
-        @as(i32, @intCast(extent.width)),
-        @as(i32, @intCast(extent.height)),
-        window_title,
-        null,
-        null,
-    ) catch {
-        if (glfw.getLastError()) |err_info| {
-            const code_opt = glfw.errorCodeFromC(err_info.code);
-            const code_str = if (code_opt) |ce| @tagName(ce) else "UnknownError";
-            const desc_str: []const u8 = err_info.description orelse "no description";
-
-            std.log.err(
-                "failed to create GLFW window: {s}: {s}",
-                .{ code_str, desc_str },
-            );
-        } else {
-            std.log.err("failed to create GLFW window (no error info)", .{});
-        }
-        return error.CreateWindowFailed;
-    };
-    defer glfw.destroyWindow(window);
-
-    const allocator = std.heap.page_allocator;
-
-    const gc = try GraphicsContext.init(allocator, app_name, window);
-    defer gc.deinit();
-
-    std.debug.print("Using device: {s}\n", .{gc.deviceName()});
-
-    var swapchain = try Swapchain.init(&gc, allocator, extent);
-    defer swapchain.deinit();
-
-    // Camera setup: simple free-fly camera starting at (0, 0, 5)
-    const aspect: f32 =
-        @as(f32, @floatFromInt(swapchain.extent.width)) /
-        @as(f32, @floatFromInt(swapchain.extent.height));
-    const fov_y: f32 = @as(f32, @floatCast(std.math.pi)) / 3.0; // ~60°
-    var camera = Camera3D.init(
-        Vec3.init(0.0, 0.0, 5.0),
-        fov_y,
-        aspect,
-        0.1,
-        100.0,
-    );
-
-    const pipeline_layout = try gc.vkd.createPipelineLayout(gc.dev, &.{
-        .flags = .{},
-        .set_layout_count = 0,
-        .p_set_layouts = undefined,
-        .push_constant_range_count = 0,
-        .p_push_constant_ranges = undefined,
-    }, null);
-    defer gc.vkd.destroyPipelineLayout(gc.dev, pipeline_layout, null);
-
-    const render_pass = try createRenderPass(&gc, swapchain);
-    defer gc.vkd.destroyRenderPass(gc.dev, render_pass, null);
-
-    const pipeline = try createPipeline(&gc, pipeline_layout, render_pass);
-    defer gc.vkd.destroyPipeline(gc.dev, pipeline, null);
-
-    var framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain);
-    defer destroyFramebuffers(&gc, allocator, framebuffers);
-
-    const pool = try gc.vkd.createCommandPool(gc.dev, &.{
-        .flags = .{},
-        .queue_family_index = gc.graphics_queue.family,
-    }, null);
-    defer gc.vkd.destroyCommandPool(gc.dev, pool, null);
-
-    // GPU vertex buffer (device-local).
-    const buffer = try gc.vkd.createBuffer(gc.dev, &.{
-        .flags = .{},
-        .size = VERTEX_BUFFER_SIZE,
-        .usage = .{
-            .transfer_dst_bit = true,
-            .vertex_buffer_bit = true,
-        },
-        .sharing_mode = .exclusive,
-        .queue_family_index_count = 0,
-        .p_queue_family_indices = undefined,
-    }, null);
-    defer gc.vkd.destroyBuffer(gc.dev, buffer, null);
-
-    const mem_reqs = gc.vkd.getBufferMemoryRequirements(gc.dev, buffer);
-    const memory = try gc.allocate(mem_reqs, .{ .device_local_bit = true });
-    defer gc.vkd.freeMemory(gc.dev, memory, null);
-    try gc.vkd.bindBufferMemory(gc.dev, buffer, memory, 0);
-
-    // Persistent staging buffer (host-visible) used to update the geometry each frame.
-    const staging_buffer = try gc.vkd.createBuffer(gc.dev, &.{
-        .flags = .{},
-        .size = VERTEX_BUFFER_SIZE,
-        .usage = .{ .transfer_src_bit = true },
-        .sharing_mode = .exclusive,
-        .queue_family_index_count = 0,
-        .p_queue_family_indices = undefined,
-    }, null);
-    defer gc.vkd.destroyBuffer(gc.dev, staging_buffer, null);
-
-    const staging_reqs = gc.vkd.getBufferMemoryRequirements(gc.dev, staging_buffer);
-    const staging_memory = try gc.allocate(staging_reqs, .{
-        .host_visible_bit = true,
-        .host_coherent_bit = true,
-    });
-    defer gc.vkd.freeMemory(gc.dev, staging_memory, null);
-    try gc.vkd.bindBufferMemory(gc.dev, staging_buffer, staging_memory, 0);
-
-    var cmdbufs = try createCommandBuffers(
-        &gc,
-        pool,
-        allocator,
-        buffer,
-        swapchain.extent,
-        render_pass,
-        pipeline,
-        framebuffers,
-    );
-    defer destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Game state + frame timer
-    // ─────────────────────────────────────────────────────────────────────
-
-    var game_state = Game.init();
-    var frame_timer = FrameTimer.init(nowMsFromGlfw(), 1000); // 1s FPS window.
-
-    // Prime the vertex buffer once so we don't start with garbage.
-    {
-        try updateWorldVertices(&gc, staging_memory, &game_state, &camera);
-        try copyBuffer(&gc, pool, buffer, staging_buffer, VERTEX_BUFFER_SIZE);
-    }
-
-    while (!glfw.windowShouldClose(window)) {
-        const tick = frame_timer.tick(nowMsFromGlfw());
-        const dt = @as(f32, @floatCast(tick.dt));
-
-        if (tick.fps_updated) {
-            std.log.info(
-                "FPS: {d:.2}, hero=({d:.2}, {d:.2}), score={d}",
-                .{ tick.fps, game_state.player_x, game_state.player_y, game_state.score },
-            );
-            updateWindowTitle(window, tick.fps, &game_state);
-        }
-
-        // Camera controls (WASD + Space/Ctrl + RMB look).
-        const cam_input = sampleCameraInput(window);
-        camera.update(dt, cam_input);
-
-        // Game input (Esc to quit).
-        const input = sampleInput(window);
-        if (input.quit) {
-            glfw.setWindowShouldClose(window, true);
-            break;
-        }
-
-        // Advance simple hero/enemy logic.
-        game_state.update(dt, input);
-
-        // Rebuild world → NDC vertices into staging, then copy to device-local buffer.
-        try updateWorldVertices(&gc, staging_memory, &game_state, &camera);
-        try copyBuffer(&gc, pool, buffer, staging_buffer, VERTEX_BUFFER_SIZE);
-
-        const cmdbuf = cmdbufs[swapchain.image_index];
-
-        const state = swapchain.present(cmdbuf) catch |err| switch (err) {
-            error.OutOfDateKHR => Swapchain.PresentState.suboptimal,
-            else => |narrow| return narrow,
-        };
-
-        if (state == .suboptimal) {
-            const size = glfw.getWindowSize(window);
-
-            // Handle minimized / zero-size window safely.
-            if (size.width == 0 or size.height == 0) {
-                glfw.pollEvents();
-                continue;
-            }
-
-            extent.width = @intCast(size.width);
-            extent.height = @intCast(size.height);
-
-            try swapchain.recreate(extent);
-
-            // Keep camera projection in sync with new swapchain size.
-            const new_aspect: f32 =
-                @as(f32, @floatFromInt(extent.width)) /
-                @as(f32, @floatFromInt(extent.height));
-            camera.setAspect(new_aspect);
-
-            destroyFramebuffers(&gc, allocator, framebuffers);
-            framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain);
-
-            destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
-            cmdbufs = try createCommandBuffers(
-                &gc,
-                pool,
-                allocator,
-                buffer,
-                swapchain.extent,
-                render_pass,
-                pipeline,
-                framebuffers,
-            );
-        }
-
-        glfw.pollEvents();
-    }
-
-    try swapchain.waitForAllFences();
 }
