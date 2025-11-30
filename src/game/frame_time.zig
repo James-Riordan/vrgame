@@ -49,7 +49,7 @@ pub const FrameTimer = struct {
             };
         }
 
-        const dt_ms = now_ms - self.last_ms;
+        const dt_ms: i64 = now_ms - self.last_ms;
         self.last_ms = now_ms;
 
         self.accum_ms += dt_ms;
@@ -57,15 +57,20 @@ pub const FrameTimer = struct {
 
         var fps_updated = false;
 
-        if (self.accum_ms >= self.fps_sample_interval_ms and self.fps_sample_interval_ms > 0) {
-            const window_s = @as(f64, @floatFromInt(self.accum_ms)) / 1000.0;
-            if (window_s > 0.0) {
-                self.current_fps = @as(f64, @floatFromInt(self.frames_in_window)) / window_s;
+        // Compute FPS over a *fixed* sample window, not the whole accumulated span.
+        if (self.fps_sample_interval_ms > 0 and self.accum_ms >= self.fps_sample_interval_ms) {
+            const interval_s = @as(f64, @floatFromInt(self.fps_sample_interval_ms)) / 1000.0;
+            if (interval_s > 0.0) {
+                self.current_fps =
+                    @as(f64, @floatFromInt(self.frames_in_window)) / interval_s;
             } else {
                 self.current_fps = 0.0;
             }
 
-            self.accum_ms = 0;
+            // Keep any overflow so we don't "lose" long-frame time.
+            self.accum_ms -= self.fps_sample_interval_ms;
+            if (self.accum_ms < 0) self.accum_ms = 0;
+
             self.frames_in_window = 0;
             fps_updated = true;
         }

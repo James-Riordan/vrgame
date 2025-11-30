@@ -7,6 +7,8 @@ const Swapchain = @import("swapchain").Swapchain;
 const Vertex = @import("vertex").Vertex;
 const FrameTimer = @import("frame_time").FrameTimer;
 
+const vr = @import("vrgame"); // facade/root module for vrgame
+
 const triangle_vert = @embedFile("triangle_vert");
 const triangle_frag = @embedFile("triangle_frag");
 
@@ -54,9 +56,8 @@ const Game = struct {
         if (input.move_left) self.player_x -= move_speed * dt;
         if (input.move_right) self.player_x += move_speed * dt;
 
-        // For now we just log occasionally so you can see something "game-like".
         // Later this will drive camera, hero, projectiles, etc.
-        // _ = self; // silence unused for now, until we wire into rendering.
+        // _ = self;
         // _ = dt;
     }
 };
@@ -201,16 +202,28 @@ pub fn main() !void {
     defer destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
 
     // ─────────────────────────────────────────────────────────────────────
-    // Game state + main loop
+    // Game state + frame timer + main loop
     // ─────────────────────────────────────────────────────────────────────
 
     var game_state = Game.init();
-    var last_time: f64 = glfw.getTime();
+
+    // Initialize frame timer from current GLFW time (in milliseconds),
+    // using a 1000 ms sample window for FPS.
+    const start_ms: i64 = @as(i64, @intFromFloat(glfw.getTime() * 1000.0));
+    var frame_timer = FrameTimer.init(start_ms, 1000);
 
     while (!glfw.windowShouldClose(window)) {
-        const now = glfw.getTime();
-        const dt = @as(f32, @floatCast(now - last_time));
-        last_time = now;
+        // Convert GLFW time (seconds) → milliseconds.
+        const now_ms: i64 = @as(i64, @intFromFloat(glfw.getTime() * 1000.0));
+        const tick_res = frame_timer.tick(now_ms);
+
+        // If dt is 0, either time didn't advance or went backwards; just poll events.
+        if (tick_res.dt <= 0.0) {
+            glfw.pollEvents();
+            continue;
+        }
+
+        const dt: f32 = @floatCast(tick_res.dt);
 
         const input = sampleInput(window);
         if (input.quit) {
@@ -219,6 +232,11 @@ pub fn main() !void {
         }
 
         game_state.update(dt, input);
+
+        // Optional: log FPS when a sample window completes.
+        if (tick_res.fps_updated) {
+            std.log.info("FPS: {d:.2}", .{tick_res.fps});
+        }
 
         const cmdbuf = cmdbufs[swapchain.image_index];
 
