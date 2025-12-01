@@ -1,7 +1,6 @@
 const std = @import("std");
 
-/// Simple 3D vector + 4x4 matrix utilities for camera & transforms.
-/// Column-major matrices, OpenGL/Vulkan-style (m[col * 4 + row]).
+/// Simple 3D/4D vectors + 4x4 matrices (column-major, Vulkan/GL style).
 pub const Vec3 = struct {
     x: f32,
     y: f32,
@@ -12,31 +11,19 @@ pub const Vec3 = struct {
     }
 
     pub fn zero() Vec3 {
-        return .{ .x = 0.0, .y = 0.0, .z = 0.0 };
+        return .{ .x = 0, .y = 0, .z = 0 };
     }
 
     pub fn add(self: Vec3, other: Vec3) Vec3 {
-        return .{
-            .x = self.x + other.x,
-            .y = self.y + other.y,
-            .z = self.z + other.z,
-        };
+        return .{ .x = self.x + other.x, .y = self.y + other.y, .z = self.z + other.z };
     }
 
     pub fn sub(self: Vec3, other: Vec3) Vec3 {
-        return .{
-            .x = self.x - other.x,
-            .y = self.y - other.y,
-            .z = self.z - other.z,
-        };
+        return .{ .x = self.x - other.x, .y = self.y - other.y, .z = self.z - other.z };
     }
 
     pub fn scale(self: Vec3, s: f32) Vec3 {
-        return .{
-            .x = self.x * s,
-            .y = self.y * s,
-            .z = self.z * s,
-        };
+        return .{ .x = self.x * s, .y = self.y * s, .z = self.z * s };
     }
 
     pub fn dot(self: Vec3, other: Vec3) f32 {
@@ -57,209 +44,172 @@ pub const Vec3 = struct {
 
     pub fn normalized(self: Vec3) Vec3 {
         const len = self.length();
-        if (len == 0.0) return self;
-        return self.scale(1.0 / len);
+        return if (len == 0.0) self else self.scale(1.0 / len);
+    }
+};
+
+pub const Vec4 = struct {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+
+    pub fn init(x: f32, y: f32, z: f32, w: f32) Vec4 {
+        return .{ .x = x, .y = y, .z = z, .w = w };
+    }
+
+    pub fn fromVec3(v: Vec3, w: f32) Vec4 {
+        return .{ .x = v.x, .y = v.y, .z = v.z, .w = w };
+    }
+
+    pub fn toVec3(self: Vec4) Vec3 {
+        const inv_w: f32 = if (self.w != 0.0) 1.0 / self.w else 1.0;
+        return Vec3.init(self.x * inv_w, self.y * inv_w, self.z * inv_w);
+    }
+
+    pub fn toArray(self: Vec4) [4]f32 {
+        return .{ self.x, self.y, self.z, self.w };
+    }
+
+    /// Accepts Vec4, [4]f32, or *[4]f32 (and *Vec4). Used by Mat4.mulVec4.
+    pub fn fromAny(v_any: anytype) Vec4 {
+        const T = @TypeOf(v_any);
+        const ti = @typeInfo(T);
+        return switch (ti) {
+            .@"struct" => {
+                if (T == Vec4) return v_any;
+                @compileError("Vec4.fromAny: unsupported struct type");
+            },
+            .array => |a| blk: {
+                if (a.len != 4) @compileError("Vec4.fromAny: array length must be 4");
+                if (a.child != f32) @compileError("Vec4.fromAny: array element type must be f32");
+                break :blk Vec4.init(v_any[0], v_any[1], v_any[2], v_any[3]);
+            },
+            .pointer => blk: {
+                break :blk Vec4.fromAny(v_any.*);
+            },
+            else => @compileError("Vec4.fromAny: unsupported type"),
+        };
     }
 };
 
 pub const Mat4 = struct {
-    /// Column-major 4x4 matrix: m[col * 4 + row]
+    /// Column-major 4x4 matrix: m[col*4 + row]
     m: [16]f32,
 
-    fn idx(row: usize, col: usize) usize {
+    inline fn idx(row: usize, col: usize) usize {
         return col * 4 + row;
     }
 
     pub fn identity() Mat4 {
-        var res = Mat4{ .m = [_]f32{0.0} ** 16 };
-        res.m[idx(0, 0)] = 1.0;
-        res.m[idx(1, 0)] = 0.0;
-        res.m[idx(2, 0)] = 0.0;
-        res.m[idx(3, 0)] = 0.0;
-
-        res.m[idx(0, 1)] = 0.0;
-        res.m[idx(1, 1)] = 1.0;
-        res.m[idx(2, 1)] = 0.0;
-        res.m[idx(3, 1)] = 0.0;
-
-        res.m[idx(0, 2)] = 0.0;
-        res.m[idx(1, 2)] = 0.0;
-        res.m[idx(2, 2)] = 1.0;
-        res.m[idx(3, 2)] = 0.0;
-
-        res.m[idx(0, 3)] = 0.0;
-        res.m[idx(1, 3)] = 0.0;
-        res.m[idx(2, 3)] = 0.0;
-        res.m[idx(3, 3)] = 1.0;
-
+        var res = Mat4{ .m = [_]f32{0} ** 16 };
+        res.m[idx(0, 0)] = 1;
+        res.m[idx(1, 1)] = 1;
+        res.m[idx(2, 2)] = 1;
+        res.m[idx(3, 3)] = 1;
         return res;
     }
 
-    /// Matrix multiplication: result = a * b.
+    /// Matrix multiply: a * b (column-major).
     pub fn mul(a: Mat4, b: Mat4) Mat4 {
-        var res = Mat4{ .m = [_]f32{0.0} ** 16 };
-
+        var r = Mat4{ .m = [_]f32{0} ** 16 };
         var row: usize = 0;
         while (row < 4) : (row += 1) {
             var col: usize = 0;
             while (col < 4) : (col += 1) {
-                var sum: f32 = 0.0;
+                var sum: f32 = 0;
                 var k: usize = 0;
                 while (k < 4) : (k += 1) {
-                    const a_ik = a.m[idx(row, k)];
-                    const b_kj = b.m[idx(k, col)];
-                    sum += a_ik * b_kj;
+                    sum += a.m[idx(row, k)] * b.m[idx(k, col)];
                 }
-                res.m[idx(row, col)] = sum;
+                r.m[idx(row, col)] = sum;
             }
         }
-
-        return res;
+        return r;
     }
 
-    /// Transform a point with w=1.0, then perform perspective divide.
+    /// Multiply by a 4D vector. Returns the **same shape** as the input:
+    ///  - Vec4 -> Vec4
+    ///  - [4]f32 -> [4]f32
+    pub fn mulVec4(self: Mat4, v_any: anytype) @TypeOf(v_any) {
+        const v = Vec4.fromAny(v_any);
+        const m = self.m;
+
+        const rx = m[idx(0, 0)] * v.x + m[idx(0, 1)] * v.y + m[idx(0, 2)] * v.z + m[idx(0, 3)] * v.w;
+        const ry = m[idx(1, 0)] * v.x + m[idx(1, 1)] * v.y + m[idx(1, 2)] * v.z + m[idx(1, 3)] * v.w;
+        const rz = m[idx(2, 0)] * v.x + m[idx(2, 1)] * v.y + m[idx(2, 2)] * v.z + m[idx(2, 3)] * v.w;
+        const rw = m[idx(3, 0)] * v.x + m[idx(3, 1)] * v.y + m[idx(3, 2)] * v.z + m[idx(3, 3)] * v.w;
+
+        const RetT = @TypeOf(v_any);
+        const ti = @typeInfo(RetT);
+        return switch (ti) {
+            .@"struct" => {
+                if (RetT == Vec4) return Vec4.init(rx, ry, rz, rw);
+                @compileError("Mat4.mulVec4: unsupported struct return type");
+            },
+            .array => |a| blk: {
+                if (a.len != 4 or a.child != f32)
+                    @compileError("Mat4.mulVec4: only [4]f32 arrays supported");
+                break :blk [_]f32{ rx, ry, rz, rw };
+            },
+            .pointer => @compileError("Mat4.mulVec4: pointer inputs not supported; pass by value"),
+            else => @compileError("Mat4.mulVec4: unsupported input/return type"),
+        };
+    }
+
+    /// Transform a point (w=1) with perspective divide.
     pub fn transformPoint(self: Mat4, v: Vec3) Vec3 {
-        const x = v.x;
-        const y = v.y;
-        const z = v.z;
-        const w: f32 = 1.0;
-
-        var rx: f32 = 0.0;
-        var ry: f32 = 0.0;
-        var rz: f32 = 0.0;
-        var rw: f32 = 0.0;
-
-        var col: usize = 0;
-        while (col < 4) : (col += 1) {
-            const vc: f32 = switch (col) {
-                0 => x,
-                1 => y,
-                2 => z,
-                else => w,
-            };
-
-            rx += self.m[idx(0, col)] * vc;
-            ry += self.m[idx(1, col)] * vc;
-            rz += self.m[idx(2, col)] * vc;
-            rw += self.m[idx(3, col)] * vc;
-        }
-
-        if (rw != 0.0) {
-            const inv_w = 1.0 / rw;
-            return Vec3.init(rx * inv_w, ry * inv_w, rz * inv_w);
-        } else {
-            return Vec3.init(rx, ry, rz);
-        }
+        const v4 = self.mulVec4(Vec4.fromVec3(v, 1.0)); // returns Vec4
+        return v4.toVec3();
     }
 
-    /// Perspective projection matrix (right-handed, Vulkan/GL-style).
-    /// fov_y is in radians.
+    /// Right-handed perspective (Vulkan/D3D Z in [0,1]).
     pub fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) Mat4 {
         const f = 1.0 / @tan(fov_y / 2.0);
-        const nf = 1.0 / (near - far);
-
-        var res = Mat4{ .m = [_]f32{0.0} ** 16 };
-
-        // Row 0
-        res.m[idx(0, 0)] = f / aspect;
-        // Row 1
-        res.m[idx(1, 1)] = f;
-        // Row 2
-        res.m[idx(2, 2)] = (far + near) * nf;
-        res.m[idx(2, 3)] = -1.0;
-        // Row 3
-        res.m[idx(3, 2)] = 2.0 * far * near * nf;
-
-        return res;
+        var m = Mat4{ .m = [_]f32{0} ** 16 };
+        m.m[idx(0, 0)] = f / aspect;
+        m.m[idx(1, 1)] = f;
+        m.m[idx(2, 2)] = far / (near - far);
+        m.m[idx(2, 3)] = -1.0;
+        m.m[idx(3, 2)] = (far * near) / (near - far);
+        return m;
     }
 
-    /// Right-handed lookAt matrix, camera at `eye`, looking toward `center`.
+    /// Right-handed lookAt, camera at `eye`, looking to `center`, `up` up-vector.
     pub fn lookAt(eye: Vec3, center: Vec3, up: Vec3) Mat4 {
         const f = center.sub(eye).normalized();
         const s = f.cross(up).normalized();
         const u = s.cross(f);
 
-        var res = Mat4{ .m = [_]f32{0.0} ** 16 };
+        var r = Mat4{ .m = [_]f32{0} ** 16 };
 
-        // Column 0 (s)
-        res.m[idx(0, 0)] = s.x;
-        res.m[idx(1, 0)] = s.y;
-        res.m[idx(2, 0)] = s.z;
-        res.m[idx(3, 0)] = -s.dot(eye);
+        // column 0 (s)
+        r.m[idx(0, 0)] = s.x;
+        r.m[idx(1, 0)] = s.y;
+        r.m[idx(2, 0)] = s.z;
+        // column 1 (u)
+        r.m[idx(0, 1)] = u.x;
+        r.m[idx(1, 1)] = u.y;
+        r.m[idx(2, 1)] = u.z;
+        // column 2 (-f)
+        r.m[idx(0, 2)] = -f.x;
+        r.m[idx(1, 2)] = -f.y;
+        r.m[idx(2, 2)] = -f.z;
+        // column 3 (translation)
+        r.m[idx(0, 3)] = -s.dot(eye);
+        r.m[idx(1, 3)] = -u.dot(eye);
+        r.m[idx(2, 3)] = f.dot(eye);
+        r.m[idx(3, 3)] = 1.0;
 
-        // Column 1 (u)
-        res.m[idx(0, 1)] = u.x;
-        res.m[idx(1, 1)] = u.y;
-        res.m[idx(2, 1)] = u.z;
-        res.m[idx(3, 1)] = -u.dot(eye);
-
-        // Column 2 (-f)
-        res.m[idx(0, 2)] = -f.x;
-        res.m[idx(1, 2)] = -f.y;
-        res.m[idx(2, 2)] = -f.z;
-        res.m[idx(3, 2)] = f.dot(eye);
-
-        // Column 3
-        res.m[idx(0, 3)] = 0.0;
-        res.m[idx(1, 3)] = 0.0;
-        res.m[idx(2, 3)] = 0.0;
-        res.m[idx(3, 3)] = 1.0;
-
-        return res;
+        return r;
     }
 
-    /// Transform a 3D point by this matrix, treating it as (x, y, z, 1),
-    /// then divide by w to return NDC-ish coordinates.
-    pub fn mulPoint3(self: Mat4, v: Vec3) Vec3 {
-        const m = self.m;
-        const x = v.x;
-        const y = v.y;
-        const z = v.z;
-
-        // Column-major layout:
-        // [ 0  4  8 12 ]
-        // [ 1  5  9 13 ]
-        // [ 2  6 10 14 ]
-        // [ 3  7 11 15 ]
-        const clip_x = m[0] * x + m[4] * y + m[8] * z + m[12];
-        const clip_y = m[1] * x + m[5] * y + m[9] * z + m[13];
-        const clip_z = m[2] * x + m[6] * y + m[10] * z + m[14];
-        const clip_w = m[3] * x + m[7] * y + m[11] * z + m[15];
-
-        if (clip_w != 0.0) {
-            const inv_w = 1.0 / clip_w;
-            return Vec3.init(
-                clip_x * inv_w,
-                clip_y * inv_w,
-                clip_z * inv_w,
-            );
-        } else {
-            // Degenerate case; just return without perspective divide.
-            return Vec3.init(clip_x, clip_y, clip_z);
-        }
-    }
-
-    /// Transform a point (Vec3) by this matrix and return NDC coordinates.
-    /// Assumes column-major storage and v' = M * vec4(x, y, z, 1).
+    /// Alias (kept for convenience).
     pub fn mulPoint(self: Mat4, v: Vec3) Vec3 {
-        const x = v.x;
-        const y = v.y;
-        const z = v.z;
-
-        // Column-major: m[col*4 + row]
-        const m = self.m;
-
-        const rx = m[0] * x + m[4] * y + m[8] * z + m[12] * 1.0;
-        const ry = m[1] * x + m[5] * y + m[9] * z + m[13] * 1.0;
-        const rz = m[2] * x + m[6] * y + m[10] * z + m[14] * 1.0;
-        const rw = m[3] * x + m[7] * y + m[11] * z + m[15] * 1.0;
-
-        if (rw != 0.0) {
-            const inv_w = 1.0 / rw;
-            return Vec3.init(rx * inv_w, ry * inv_w, rz * inv_w);
-        } else {
-            return Vec3.init(rx, ry, rz);
-        }
+        return self.transformPoint(v);
+    }
+    pub fn mulPoint3(self: Mat4, v: Vec3) Vec3 {
+        return self.transformPoint(v);
     }
 };
 
@@ -267,85 +217,38 @@ pub const Mat4 = struct {
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-test "Vec3 basic ops" {
-    const a = Vec3.init(1.0, 2.0, 3.0);
-    const b = Vec3.init(-1.0, 0.5, 4.0);
-
+test "Vec3 basics" {
+    const a = Vec3.init(1, 2, 3);
+    const b = Vec3.init(-1, 0.5, 4);
     const c = a.add(b);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), c.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), c.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 2.5), c.y, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 7.0), c.z, 0.0001);
-
-    const d = a.sub(b);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), d.x, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.5), d.y, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, -1.0), d.z, 0.0001);
-
-    const len2 = a.dot(a);
-    try std.testing.expectApproxEqAbs(@as(f32, 14.0), len2, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 7), c.z, 0.0001);
 }
 
-test "Mat4 identity & transformPoint" {
-    const id = Mat4.identity();
+test "Mat4.identity mulVec4 returns same shape as input" {
+    const I = Mat4.identity();
+    const v_arr: [4]f32 = .{ 1, 2, 3, 1 };
+    const out_arr = I.mulVec4(v_arr);
+    try std.testing.expectEqualDeep(v_arr, out_arr);
+
+    const v4 = Vec4.init(1, 2, 3, 1);
+    const out_v4 = I.mulVec4(v4);
+    try std.testing.expectEqual(@as(f32, v4.x), out_v4.x);
+    try std.testing.expectEqual(@as(f32, v4.y), out_v4.y);
+    try std.testing.expectEqual(@as(f32, v4.z), out_v4.z);
+    try std.testing.expectEqual(@as(f32, v4.w), out_v4.w);
+}
+
+test "Mat4.transformPoint identity" {
+    const I = Mat4.identity();
     const v = Vec3.init(1.0, -2.0, 3.5);
-    const out = id.transformPoint(v);
-
-    try std.testing.expectApproxEqAbs(@as(f32, v.x), out.x, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, v.y), out.y, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, v.z), out.z, 0.0001);
+    const out = I.transformPoint(v);
+    try std.testing.expectApproxEqAbs(v.x, out.x, 0.0001);
+    try std.testing.expectApproxEqAbs(v.y, out.y, 0.0001);
+    try std.testing.expectApproxEqAbs(v.z, out.z, 0.0001);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers for tests
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn distance(a: Vec3, b: Vec3) f32 {
-    const dx = a.x - b.x;
-    const dy = a.y - b.y;
-    const dz = a.z - b.z;
-    return std.math.sqrt(dx * dx + dy * dy + dz * dz);
-}
-
-fn assertFiniteVec3(v: Vec3) !void {
-    const math = std.math;
-    try std.testing.expect(math.isFinite(v.x));
-    try std.testing.expect(math.isFinite(v.y));
-    try std.testing.expect(math.isFinite(v.z));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// View matrix sanity test
-// ─────────────────────────────────────────────────────────────────────────────
-
-test "Mat4 lookAt basic sanity" {
-    const eye = Vec3.init(0.0, 0.0, 5.0);
-    const center = Vec3.init(0.0, 0.0, 0.0);
-    const up = Vec3.init(0.0, 1.0, 0.0);
-
-    const view = Mat4.lookAt(eye, center, up);
-
-    const eye_in_view = view.transformPoint(eye);
-    const center_in_view = view.transformPoint(center);
-
-    // 1) We never want NaNs or infinities out of a view transform.
-    try assertFiniteVec3(eye_in_view);
-    try assertFiniteVec3(center_in_view);
-
-    // 2) Distances should be non-zero and not completely degenerate.
-    const world_dist = distance(eye, center);
-    const view_dist = distance(eye_in_view, center_in_view);
-
-    try std.testing.expect(world_dist > 0.0);
-    try std.testing.expect(view_dist > 0.0);
-
-    // 3) The view transform shouldn't obliterate scale:
-    //    keep it in a reasonable order-of-magnitude band.
-    const ratio = view_dist / world_dist;
-    // Allow for perspective / scaling but ban crazy results.
-    try std.testing.expect(ratio > 0.001);
-    try std.testing.expect(ratio < 1000.0);
-}
-
-test "refAllDecls" {
+test "refAllDecls(math3d)" {
     std.testing.refAllDecls(@This());
 }

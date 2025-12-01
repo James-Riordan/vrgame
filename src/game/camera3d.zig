@@ -56,8 +56,8 @@ pub const Camera3D = struct {
             .aspect = aspect,
             .near = near,
             .far = far,
-            .move_speed = 4.0,
-            .look_sensitivity = 0.0025,
+            .move_speed = 3.0,
+            .look_sensitivity = 0.0018,
         };
     }
 

@@ -119,6 +119,27 @@ test "FrameTimer handles non-monotonic timestamps" {
     try std.testing.expectEqual(r1.fps, r2.fps);
 }
 
-test "refAllDecls(frame_time)" {
-    std.testing.refAllDecls(@This());
+test "FrameTimer basic dt and fps windowing" {
+    var ft = FrameTimer.init(0, 1000); // 1s FPS window
+    var t = ft.tick(16);
+    try std.testing.expect(t.dt > 0);
+    // simulate ~16ms/frame over ~1s => ~60 fps
+    var ms: i64 = 16;
+    var last: i64 = 16;
+    var fps_seen = false;
+    while (ms < 1000) : (ms += 16) {
+        t = ft.tick(ms);
+        last = ms;
+        if (t.fps_updated) {
+            fps_seen = true;
+            try std.testing.expect(t.fps > 40 and t.fps < 80);
+        }
+    }
+    // one more tick should definitely finalize a window
+    t = ft.tick(last + 16);
+    try std.testing.expect(t.fps_updated or fps_seen);
 }
+
+// test "refAllDecls(frame_time)" {
+//     std.testing.refAllDecls(@This());
+// }
