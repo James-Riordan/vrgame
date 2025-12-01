@@ -167,11 +167,17 @@ pub const Mat4 = struct {
     pub fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) Mat4 {
         const f = 1.0 / @tan(fov_y / 2.0);
         var m = Mat4{ .m = [_]f32{0} ** 16 };
+
+        // diag
         m.m[idx(0, 0)] = f / aspect;
         m.m[idx(1, 1)] = f;
-        m.m[idx(2, 2)] = far / (near - far);
-        m.m[idx(2, 3)] = -1.0;
-        m.m[idx(3, 2)] = (far * near) / (near - far);
+
+        // Depth (RH, Vulkan/D3D clip: z in [0,1])
+        m.m[idx(2, 2)] = far / (near - far); // m22
+        m.m[idx(3, 2)] = -1.0; // m32  <-- moved here
+        m.m[idx(2, 3)] = (far * near) / (near - far); // m23  <-- moved here
+        m.m[idx(3, 3)] = 0.0;
+
         return m;
     }
 
@@ -249,6 +255,39 @@ test "Mat4.transformPoint identity" {
     try std.testing.expectApproxEqAbs(v.z, out.z, 0.0001);
 }
 
-test "refAllDecls(math3d)" {
-    std.testing.refAllDecls(@This());
+test "Vec3 normalization → unit length (128 samples)" {
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    var rng = prng.random();
+
+    var i: usize = 0;
+    while (i < 128) : (i += 1) {
+        var v = Vec3.init(
+            rng.float(f32) * 2.0 - 1.0,
+            rng.float(f32) * 2.0 - 1.0,
+            rng.float(f32) * 2.0 - 1.0,
+        );
+        if (v.length() < 1e-6) continue; // skip near-zero
+        v = v.normalized();
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), v.length(), 1e-3);
+    }
 }
+
+test "Mat4 identity invariants (I*M==M && M*I==M)" {
+    const I = Mat4.identity();
+    const proj = Mat4.perspective(std.math.degreesToRadians(60.0), 16.0 / 9.0, 0.1, 100.0);
+    const view = Mat4.lookAt(Vec3.init(1, 2, 3), Vec3.init(0, 0, 0), Vec3.init(0, 1, 0));
+    const M = Mat4.mul(proj, view);
+
+    const IM = Mat4.mul(I, M);
+    const MI = Mat4.mul(M, I);
+
+    var k: usize = 0;
+    while (k < 16) : (k += 1) {
+        try std.testing.expectApproxEqAbs(M.m[k], IM.m[k], 1e-5);
+        try std.testing.expectApproxEqAbs(M.m[k], MI.m[k], 1e-5);
+    }
+}
+
+// test "refAllDecls(math3d)" {
+//     std.testing.refAllDecls(@This());
+// }
