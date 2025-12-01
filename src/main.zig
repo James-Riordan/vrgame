@@ -1,3 +1,4 @@
+
 const std = @import("std");
 const builtin = @import("builtin");
 const glfw = @import("glfw");
@@ -42,19 +43,21 @@ const VERTEX_BUFFER_SIZE: vk.DeviceSize =
     @intCast(@as(usize, TOTAL_VERTICES) * @sizeOf(Vertex));
 
 // Depth resources
-const DepthResources = struct {
-    image: vk.Image,
-    memory: vk.DeviceMemory,
-    view: vk.ImageView,
-};
+const DepthResources = struct { image: vk.Image, memory: vk.DeviceMemory, view: vk.ImageView };
 
 // Push-constant block (std430)
 const Push = extern struct { m: [16]f32 };
 
-// Zig 0.16-dev API: readFileAlloc(sub_path, max_bytes, allocator)
+// ── Y policy (runtime-togglable)
+// Two clearly-defined options:
+//   • viewport: negative viewport height (no projection change)
+//   • projection: positive viewport + negate m[5] in VP
+const YPolicy = enum { viewport, projection };
+var g_y_policy: YPolicy = .viewport; // default works on macOS and (for many drivers) Windows
+
+// ── File helpers
 fn readWholeFile(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    const limit: std.Io.Limit = @enumFromInt(max_bytes);
-    return try std.fs.cwd().readFileAlloc(path, alloc, limit);
+    return try std.fs.cwd().readFileAlloc(path, alloc, @as(std.Io.Limit, @enumFromInt(max_bytes)));
 }
 
 fn loadSpirvFromExeDirAligned(alloc: Allocator, rel: []const u8) ![]u8 {
@@ -74,12 +77,14 @@ fn loadSpirvFromExeDirAligned(alloc: Allocator, rel: []const u8) ![]u8 {
     return out;
 }
 
+// ── UI / misc
 fn updateWindowTitle(window: *glfw.Window, fps: f64, cam: *const Camera3D) void {
-    var buf: [200]u8 = undefined;
+    var buf: [256]u8 = undefined;
+    const mode = switch (g_y_policy) { .viewport => "viewport", .projection => "projection" };
     const title = std.fmt.bufPrintZ(
         &buf,
-        "{s} | FPS: {d:.1} | Cam: x={d:.2}, y={d:.2}, z={d:.2}",
-        .{ window_title_base, fps, cam.position.x, cam.position.y, cam.position.z },
+        "{s} | FPS: {d:.1} | Cam: x={d:.2}, y={d:.2}, z={d:.2} | Y: {s} (F6 to toggle)",
+        .{ window_title_base, fps, cam.position.x, cam.position.y, cam.position.z, mode },
     ) catch return;
     glfw.setWindowTitle(window, title);
 }
@@ -203,13 +208,8 @@ fn writeFloorWorld(verts: [*]Vertex) void {
             const p11 = [3]f32{ x1, 0.0, z1 };
             const p01 = [3]f32{ x0, 0.0, z1 };
 
-            const ix: i32 = x + GRID_HALF;
-            const iz: i32 = z + GRID_HALF;
-            const is_light = (((ix + iz) & 1) == 0);
-            const color: [3]f32 = if (is_light)
-                .{ 0.86, 0.88, 0.92 }
-            else
-                .{ 0.20, 0.22, 0.26 };
+            const is_light = (((x + GRID_HALF) + (z + GRID_HALF)) & 1) == 0;
+            const color: [3]f32 = if (is_light) .{ 0.86, 0.88, 0.92 } else .{ 0.20, 0.22, 0.26 };
 
             verts[idx + 0] = .{ .pos = p00, .color = color };
             verts[idx + 1] = .{ .pos = p10, .color = color };
@@ -223,264 +223,8 @@ fn writeFloorWorld(verts: [*]Vertex) void {
     std.debug.assert(idx == @as(usize, TOTAL_VERTICES));
 }
 
-// ── Main
-pub fn main() !void {
-    _ = glfw.setErrorCallback(errorCallback);
-    try glfw.init();
-    defer glfw.terminate();
-
-    // Start with a sensible logical size; GLFW will give us pixel size next.
-    var extent = vk.Extent2D{ .width = 1280, .height = 800 };
-
-    glfw.defaultWindowHints();
-    glfw.windowHint(glfw.c.GLFW_CLIENT_API, glfw.c.GLFW_NO_API);
-
-    if (glfw.getPrimaryMonitor()) |mon| {
-        const wa = glfw.getMonitorWorkarea(mon);
-        if (wa.width > 0 and wa.height > 0) {
-            extent.width = @intCast(@divTrunc(wa.width * 3, 4));
-            extent.height = @intCast(@divTrunc(wa.height * 3, 4));
-        } else if (glfw.getVideoMode(mon)) |vm| {
-            extent.width = @intCast(@divTrunc(vm.width * 3, 4));
-            extent.height = @intCast(@divTrunc(vm.height * 3, 4));
-        }
-    }
-
-    const window = try glfw.createWindow(
-        @as(i32, @intCast(extent.width)),
-        @as(i32, @intCast(extent.height)),
-        window_title_cstr,
-        null,
-        null,
-    );
-    defer glfw.destroyWindow(window);
-
-    // Use framebuffer pixel size (retina-safe) as the true swapchain extent.
-    const fb = glfw.getFramebufferSize(window);
-    // Zig 0.16: use @max (args must be same type)
-    extent.width = @intCast(@max(@as(i32, 1), fb.width));
-    extent.height = @intCast(@max(@as(i32, 1), fb.height));
-
-    const allocator = std.heap.c_allocator;
-    var gc = try GraphicsContext.init(allocator, window_title_cstr, window);
-    defer gc.deinit();
-
-    var swapchain = try Swapchain.init(&gc, allocator, extent);
-    defer swapchain.deinit();
-
-    // Pipeline layout with push constants (mat4 VP)
-    const push_range = vk.PushConstantRange{
-        .stage_flags = .{ .vertex_bit = true },
-        .offset = 0,
-        .size = @sizeOf(Push),
-    };
-    const pipeline_layout = try gc.vkd.createPipelineLayout(gc.dev, &vk.PipelineLayoutCreateInfo{
-        .flags = .{},
-        .set_layout_count = 0,
-        .p_set_layouts = undefined,
-        .push_constant_range_count = 1,
-        .p_push_constant_ranges = @ptrCast(&push_range),
-    }, null);
-    defer gc.vkd.destroyPipelineLayout(gc.dev, pipeline_layout, null);
-
-    const depth_format: vk.Format = .d32_sfloat;
-    var depth = try createDepthResources(&gc, depth_format, swapchain.extent);
-    defer destroyDepthResources(&gc, depth);
-
-    const render_pass = try createRenderPass(&gc, swapchain, depth_format);
-    defer gc.vkd.destroyRenderPass(gc.dev, render_pass, null);
-
-    const pipeline = try createPipeline(&gc, pipeline_layout, render_pass);
-    defer gc.vkd.destroyPipeline(gc.dev, pipeline, null);
-
-    var framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth.view);
-    defer destroyFramebuffers(&gc, allocator, framebuffers);
-
-    // Command pool can reset individual buffers
-    const cmd_pool = try gc.vkd.createCommandPool(gc.dev, &vk.CommandPoolCreateInfo{
-        .flags = .{ .reset_command_buffer_bit = true },
-        .queue_family_index = gc.graphics_queue.family,
-    }, null);
-    defer gc.vkd.destroyCommandPool(gc.dev, cmd_pool, null);
-
-    // Vertex buffers
-    const vbuf = try gc.vkd.createBuffer(gc.dev, &vk.BufferCreateInfo{
-        .flags = .{},
-        .size = VERTEX_BUFFER_SIZE,
-        .usage = .{ .transfer_dst_bit = true, .vertex_buffer_bit = true },
-        .sharing_mode = .exclusive,
-        .queue_family_index_count = 0,
-        .p_queue_family_indices = undefined,
-    }, null);
-    defer gc.vkd.destroyBuffer(gc.dev, vbuf, null);
-
-    const vreqs = gc.vkd.getBufferMemoryRequirements(gc.dev, vbuf);
-    const vmem = try gc.allocate(vreqs, .{ .device_local_bit = true });
-    defer gc.vkd.freeMemory(gc.dev, vmem, null);
-    try gc.vkd.bindBufferMemory(gc.dev, vbuf, vmem, 0);
-
-    const sbuf = try gc.vkd.createBuffer(gc.dev, &vk.BufferCreateInfo{
-        .flags = .{},
-        .size = VERTEX_BUFFER_SIZE,
-        .usage = .{ .transfer_src_bit = true },
-        .sharing_mode = .exclusive,
-        .queue_family_index_count = 0,
-        .p_queue_family_indices = undefined,
-    }, null);
-    defer gc.vkd.destroyBuffer(gc.dev, sbuf, null);
-
-    const sreqs = gc.vkd.getBufferMemoryRequirements(gc.dev, sbuf);
-    const smem = try gc.allocate(sreqs, .{ .host_visible_bit = true, .host_coherent_bit = true });
-    defer gc.vkd.freeMemory(gc.dev, smem, null);
-    try gc.vkd.bindBufferMemory(gc.dev, sbuf, smem, 0);
-
-    // Allocate per-swapchain command buffers
-    var cmdbufs = try allocator.alloc(vk.CommandBuffer, framebuffers.len);
-    defer allocator.free(cmdbufs);
-    try gc.vkd.allocateCommandBuffers(gc.dev, &vk.CommandBufferAllocateInfo{
-        .command_pool = cmd_pool,
-        .level = .primary,
-        .command_buffer_count = @intCast(cmdbufs.len),
-    }, cmdbufs.ptr);
-
-    // Upload world vertices
-    {
-        const ptr = try gc.vkd.mapMemory(gc.dev, smem, 0, vk.WHOLE_SIZE, .{});
-        defer gc.vkd.unmapMemory(gc.dev, smem);
-        const verts: [*]Vertex = @ptrCast(@alignCast(ptr));
-        writeFloorWorld(verts);
-        try copyBuffer(&gc, cmd_pool, vbuf, sbuf, VERTEX_BUFFER_SIZE);
-    }
-
-    // Camera
-    const fovy: f32 = @floatCast(std.math.degreesToRadians(70.0));
-    var camera = Camera3D.init(
-        Vec3.init(0.0, 1.7, 4.0),
-        fovy,
-        @as(f32, @floatFromInt(swapchain.extent.width)) /
-            @as(f32, @floatFromInt(swapchain.extent.height)),
-        0.1,
-        500.0,
-    );
-
-    var frame_timer = FrameTimer.init(nowMsFromGlfw(), 1000);
-
-    while (!glfw.windowShouldClose(window)) {
-        const tick = frame_timer.tick(nowMsFromGlfw());
-        var dt = @as(f32, @floatCast(tick.dt));
-        if (tick.fps_updated) updateWindowTitle(window, tick.fps, &camera);
-
-        const esc = glfw.getKey(window, glfw.c.GLFW_KEY_ESCAPE);
-        if (esc == glfw.c.GLFW_PRESS or esc == glfw.c.GLFW_REPEAT) glfw.setWindowShouldClose(window, true);
-
-        const ls = glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_SHIFT);
-        const rs = glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_SHIFT);
-        if (ls == glfw.c.GLFW_PRESS or ls == glfw.c.GLFW_REPEAT or rs == glfw.c.GLFW_PRESS or rs == glfw.c.GLFW_REPEAT) {
-            dt *= 2.5;
-        }
-
-        const input = sampleCameraInput(window);
-        camera.update(dt, input);
-
-        // Record
-        const cmdbuf = cmdbufs[swapchain.image_index];
-        try gc.vkd.resetCommandBuffer(cmdbuf, .{});
-        try gc.vkd.beginCommandBuffer(cmdbuf, &vk.CommandBufferBeginInfo{
-            .flags = .{},
-            .p_inheritance_info = null,
-        });
-
-        // Always drive viewport/scissor from the swapchain pixel extent.
-        const fb_extent = swapchain.extent;
-
-        var viewport = vk.Viewport{
-            .x = 0,
-            .y = if (builtin.os.tag == .macos)
-                @as(f32, @floatFromInt(fb_extent.height))
-            else
-                0,
-            .width = @as(f32, @floatFromInt(fb_extent.width)),
-            .height = if (builtin.os.tag == .macos)
-                -@as(f32, @floatFromInt(fb_extent.height))
-            else
-                @as(f32, @floatFromInt(fb_extent.height)),
-            .min_depth = 0,
-            .max_depth = 1,
-        };
-        const scissor = vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = fb_extent };
-        gc.vkd.cmdSetViewport(cmdbuf, 0, 1, @as([*]const vk.Viewport, @ptrCast(&viewport)));
-        gc.vkd.cmdSetScissor(cmdbuf, 0, 1, @as([*]const vk.Rect2D, @ptrCast(&scissor)));
-
-        const clear_color = vk.ClearValue{ .color = .{ .float_32 = .{ 0.05, 0.05, 0.07, 1.0 } } };
-        const clear_depth = vk.ClearValue{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } };
-        var clears = [_]vk.ClearValue{ clear_color, clear_depth };
-
-        const rp_begin = vk.RenderPassBeginInfo{
-            .render_pass = render_pass,
-            .framebuffer = framebuffers[swapchain.image_index],
-            .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = fb_extent },
-            .clear_value_count = @intCast(clears.len),
-            .p_clear_values = &clears,
-        };
-        gc.vkd.cmdBeginRenderPass(cmdbuf, &rp_begin, vk.SubpassContents.@"inline");
-
-        gc.vkd.cmdBindPipeline(cmdbuf, .graphics, pipeline);
-        const offsets = [_]vk.DeviceSize{0};
-        gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @as([*]const vk.Buffer, @ptrCast(&vbuf)), &offsets);
-
-        // Push VP (no manual Y-flip; mac fix is via negative viewport height)
-        const push = Push{ .m = camera.viewProjMatrix().m };
-        gc.vkd.cmdPushConstants(cmdbuf, pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(Push), @ptrCast(&push));
-
-        gc.vkd.cmdDraw(cmdbuf, TOTAL_VERTICES, 1, 0, 0);
-        gc.vkd.cmdEndRenderPass(cmdbuf);
-        try gc.vkd.endCommandBuffer(cmdbuf);
-
-        const state = swapchain.present(cmdbuf) catch |err| switch (err) {
-            error.OutOfDateKHR => Swapchain.PresentState.suboptimal,
-            else => |narrow| return narrow,
-        };
-
-        // Decide at runtime, but guard the optional method at comptime
-        var need_recreate = (state == .suboptimal);
-        const has_take = @hasDecl(GraphicsContext, "takeResizeFlag");
-        if (has_take) {
-            // Only call if it exists
-            need_recreate = need_recreate or gc.takeResizeFlag();
-        }
-
-        if (need_recreate) {
-            // Rebuild using true framebuffer pixel size (retina-safe)
-            const fb2 = glfw.getFramebufferSize(window);
-            extent.width = @intCast(@max(@as(i32, 1), fb2.width));
-            extent.height = @intCast(@max(@as(i32, 1), fb2.height));
-
-            try swapchain.recreate(extent);
-
-            const new_aspect: f32 =
-                @as(f32, @floatFromInt(extent.width)) / @as(f32, @floatFromInt(extent.height));
-            if (comptime @hasField(@TypeOf(camera), "aspect")) camera.aspect = new_aspect;
-
-            destroyFramebuffers(&gc, allocator, framebuffers);
-            destroyDepthResources(&gc, depth);
-            depth = try createDepthResources(&gc, depth_format, swapchain.extent);
-            framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth.view);
-        }
-
-        glfw.pollEvents();
-    }
-
-    try swapchain.waitForAllFences();
-}
-
 // ── Buffer copy
-fn copyBuffer(
-    gc: *const GraphicsContext,
-    pool: vk.CommandPool,
-    dst: vk.Buffer,
-    src: vk.Buffer,
-    size: vk.DeviceSize,
-) !void {
+fn copyBuffer(gc: *const GraphicsContext, pool: vk.CommandPool, dst: vk.Buffer, src: vk.Buffer, size: vk.DeviceSize) !void {
     var cmdbuf: vk.CommandBuffer = undefined;
     try gc.vkd.allocateCommandBuffers(gc.dev, &vk.CommandBufferAllocateInfo{
         .command_pool = pool,
@@ -514,13 +258,7 @@ fn copyBuffer(
 }
 
 // ── Framebuffers / Render pass / Pipeline
-fn createFramebuffers(
-    gc: *const GraphicsContext,
-    allocator: Allocator,
-    render_pass: vk.RenderPass,
-    swapchain: Swapchain,
-    depth_view: vk.ImageView,
-) ![]vk.Framebuffer {
+fn createFramebuffers(gc: *const GraphicsContext, allocator: Allocator, render_pass: vk.RenderPass, swapchain: Swapchain, depth_view: vk.ImageView) ![]vk.Framebuffer {
     const fbs = try allocator.alloc(vk.Framebuffer, swapchain.swap_images.len);
     errdefer allocator.free(fbs);
 
@@ -544,11 +282,7 @@ fn createFramebuffers(
     return fbs;
 }
 
-fn destroyFramebuffers(
-    gc: *const GraphicsContext,
-    allocator: Allocator,
-    framebuffers: []const vk.Framebuffer,
-) void {
+fn destroyFramebuffers(gc: *const GraphicsContext, allocator: Allocator, framebuffers: []const vk.Framebuffer) void {
     for (framebuffers) |fb| gc.vkd.destroyFramebuffer(gc.dev, fb, null);
     allocator.free(framebuffers);
 }
@@ -607,11 +341,7 @@ fn createRenderPass(gc: *const GraphicsContext, swapchain: Swapchain, depth_form
     }, null);
 }
 
-fn createPipeline(
-    gc: *const GraphicsContext,
-    layout: vk.PipelineLayout,
-    render_pass: vk.RenderPass,
-) !vk.Pipeline {
+fn createPipeline(gc: *const GraphicsContext, layout: vk.PipelineLayout, render_pass: vk.RenderPass) !vk.Pipeline {
     const A = std.heap.c_allocator;
     const vert_bytes = try loadSpirvFromExeDirAligned(A, "shaders/triangle_vert");
     defer A.free(vert_bytes);
@@ -690,24 +420,8 @@ fn createPipeline(
         .depth_compare_op = .less,
         .depth_bounds_test_enable = VK_FALSE32,
         .stencil_test_enable = VK_FALSE32,
-        .front = .{
-            .fail_op = .keep,
-            .pass_op = .keep,
-            .depth_fail_op = .keep,
-            .compare_op = .always,
-            .compare_mask = 0,
-            .write_mask = 0,
-            .reference = 0,
-        },
-        .back = .{
-            .fail_op = .keep,
-            .pass_op = .keep,
-            .depth_fail_op = .keep,
-            .compare_op = .always,
-            .compare_mask = 0,
-            .write_mask = 0,
-            .reference = 0,
-        },
+        .front = .{ .fail_op = .keep, .pass_op = .keep, .depth_fail_op = .keep, .compare_op = .always, .compare_mask = 0, .write_mask = 0, .reference = 0 },
+        .back = .{ .fail_op = .keep, .pass_op = .keep, .depth_fail_op = .keep, .compare_op = .always, .compare_mask = 0, .write_mask = 0, .reference = 0 },
         .min_depth_bounds = 0.0,
         .max_depth_bounds = 1.0,
     };
@@ -769,4 +483,263 @@ fn createPipeline(
         @as([*]vk.Pipeline, @ptrCast(&pipeline)),
     );
     return pipeline;
+}
+
+// ── Main
+pub fn main() !void {
+    _ = glfw.setErrorCallback(errorCallback);
+    try glfw.init();
+    defer glfw.terminate();
+
+    var extent = vk.Extent2D{ .width = 1280, .height = 800 };
+    glfw.defaultWindowHints();
+    glfw.windowHint(glfw.c.GLFW_CLIENT_API, glfw.c.GLFW_NO_API);
+
+    if (glfw.getPrimaryMonitor()) |mon| {
+        const wa = glfw.getMonitorWorkarea(mon);
+        if (wa.width > 0 and wa.height > 0) {
+            extent.width = @intCast(@divTrunc(wa.width * 3, 4));
+            extent.height = @intCast(@divTrunc(wa.height * 3, 4));
+        } else if (glfw.getVideoMode(mon)) |vm| {
+            extent.width = @intCast(@divTrunc(vm.width * 3, 4));
+            extent.height = @intCast(@divTrunc(vm.height * 3, 4));
+        }
+    }
+
+    const window = try glfw.createWindow(
+        @as(i32, @intCast(extent.width)),
+        @as(i32, @intCast(extent.height)),
+        window_title_cstr,
+        null,
+        null,
+    );
+    defer glfw.destroyWindow(window);
+
+    // Use true framebuffer pixels (retina-safe).
+    const fb = glfw.getFramebufferSize(window);
+    extent.width = @intCast(@max(@as(i32, 1), fb.width));
+    extent.height = @intCast(@max(@as(i32, 1), fb.height));
+
+    const allocator = std.heap.c_allocator;
+    var gc = try GraphicsContext.init(allocator, window_title_cstr, window);
+    defer gc.deinit();
+
+    var swapchain = try Swapchain.init(&gc, allocator, extent);
+    defer swapchain.deinit();
+
+    // Pipeline layout with push constants (mat4 VP)
+    const push_range = vk.PushConstantRange{
+        .stage_flags = .{ .vertex_bit = true },
+        .offset = 0,
+        .size = @sizeOf(Push),
+    };
+    const pipeline_layout = try gc.vkd.createPipelineLayout(gc.dev, &vk.PipelineLayoutCreateInfo{
+        .flags = .{},
+        .set_layout_count = 0,
+        .p_set_layouts = undefined,
+        .push_constant_range_count = 1,
+        .p_push_constant_ranges = @ptrCast(&push_range),
+    }, null);
+    defer gc.vkd.destroyPipelineLayout(gc.dev, pipeline_layout, null);
+
+    const depth_format: vk.Format = .d32_sfloat;
+    var depth = try createDepthResources(&gc, depth_format, swapchain.extent);
+    defer destroyDepthResources(&gc, depth);
+
+    const render_pass = try createRenderPass(&gc, swapchain, depth_format);
+    defer gc.vkd.destroyRenderPass(gc.dev, render_pass, null);
+
+    const pipeline = try createPipeline(&gc, pipeline_layout, render_pass);
+    defer gc.vkd.destroyPipeline(gc.dev, pipeline, null);
+
+    var framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth.view);
+    defer destroyFramebuffers(&gc, allocator, framebuffers);
+
+    // Command pool
+    const cmd_pool = try gc.vkd.createCommandPool(gc.dev, &vk.CommandPoolCreateInfo{
+        .flags = .{ .reset_command_buffer_bit = true },
+        .queue_family_index = gc.graphics_queue.family,
+    }, null);
+    defer gc.vkd.destroyCommandPool(gc.dev, cmd_pool, null);
+
+    // Vertex buffers
+    const vbuf = try gc.vkd.createBuffer(gc.dev, &vk.BufferCreateInfo{
+        .flags = .{},
+        .size = VERTEX_BUFFER_SIZE,
+        .usage = .{ .transfer_dst_bit = true, .vertex_buffer_bit = true },
+        .sharing_mode = .exclusive,
+        .queue_family_index_count = 0,
+        .p_queue_family_indices = undefined,
+    }, null);
+    defer gc.vkd.destroyBuffer(gc.dev, vbuf, null);
+
+    const vreqs = gc.vkd.getBufferMemoryRequirements(gc.dev, vbuf);
+    const vmem = try gc.allocate(vreqs, .{ .device_local_bit = true });
+    defer gc.vkd.freeMemory(gc.dev, vmem, null);
+    try gc.vkd.bindBufferMemory(gc.dev, vbuf, vmem, 0);
+
+    const sbuf = try gc.vkd.createBuffer(gc.dev, &vk.BufferCreateInfo{
+        .flags = .{},
+        .size = VERTEX_BUFFER_SIZE,
+        .usage = .{ .transfer_src_bit = true },
+        .sharing_mode = .exclusive,
+        .queue_family_index_count = 0,
+        .p_queue_family_indices = undefined,
+    }, null);
+    defer gc.vkd.destroyBuffer(gc.dev, sbuf, null);
+
+    const sreqs = gc.vkd.getBufferMemoryRequirements(gc.dev, sbuf);
+    const smem = try gc.allocate(sreqs, .{ .host_visible_bit = true, .host_coherent_bit = true });
+    defer gc.vkd.freeMemory(gc.dev, smem, null);
+    try gc.vkd.bindBufferMemory(gc.dev, sbuf, smem, 0);
+
+    // Upload world vertices
+    {
+        const ptr = try gc.vkd.mapMemory(gc.dev, smem, 0, vk.WHOLE_SIZE, .{});
+        defer gc.vkd.unmapMemory(gc.dev, smem);
+        const verts: [*]Vertex = @ptrCast(@alignCast(ptr));
+        writeFloorWorld(verts);
+        try copyBuffer(&gc, cmd_pool, vbuf, sbuf, VERTEX_BUFFER_SIZE);
+    }
+
+    // Camera
+    const fovy: f32 = @floatCast(std.math.degreesToRadians(70.0));
+    var camera = Camera3D.init(
+        Vec3.init(0.0, 1.7, 4.0),
+        fovy,
+        @as(f32, @floatFromInt(swapchain.extent.width)) /
+            @as(f32, @floatFromInt(swapchain.extent.height)),
+        0.1,
+        500.0,
+    );
+
+    var frame_timer = FrameTimer.init(nowMsFromGlfw(), 1000);
+
+    // Lazy-allocated command buffers (cached)
+    const cmdbufs = cmdbufsForSwap(&gc, allocator, cmd_pool, framebuffers.len);
+
+    var prev_f6: i32 = glfw.c.GLFW_RELEASE;
+
+    while (!glfw.windowShouldClose(window)) {
+        const tick = frame_timer.tick(nowMsFromGlfw());
+        var dt = @as(f32, @floatCast(tick.dt));
+        if (tick.fps_updated) updateWindowTitle(window, tick.fps, &camera);
+
+        // Toggle Y-policy
+        const f6 = glfw.getKey(window, glfw.c.GLFW_KEY_F6);
+        if (f6 == glfw.c.GLFW_PRESS and prev_f6 == glfw.c.GLFW_RELEASE) {
+            g_y_policy = switch (g_y_policy) { .viewport => .projection, .projection => .viewport };
+        }
+        prev_f6 = f6;
+
+        const esc = glfw.getKey(window, glfw.c.GLFW_KEY_ESCAPE);
+        if (esc == glfw.c.GLFW_PRESS or esc == glfw.c.GLFW_REPEAT) glfw.setWindowShouldClose(window, true);
+
+        const ls = glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_SHIFT);
+        const rs = glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_SHIFT);
+        if (ls == glfw.c.GLFW_PRESS or ls == glfw.c.GLFW_REPEAT or rs == glfw.c.GLFW_PRESS or rs == glfw.c.GLFW_REPEAT) {
+            dt *= 2.5;
+        }
+
+        const input = sampleCameraInput(window);
+        camera.update(dt, input);
+
+        // Record
+        const cmdbuf = cmdbufs[swapchain.image_index];
+        try gc.vkd.resetCommandBuffer(cmdbuf, .{});
+        try gc.vkd.beginCommandBuffer(cmdbuf, &vk.CommandBufferBeginInfo{ .flags = .{}, .p_inheritance_info = null });
+
+        const fb_extent = swapchain.extent;
+
+        var viewport = vk.Viewport{
+            .x = 0,
+            .y = if (g_y_policy == .viewport) @as(f32, @floatFromInt(fb_extent.height)) else 0,
+            .width = @as(f32, @floatFromInt(fb_extent.width)),
+            .height = if (g_y_policy == .viewport)
+                -@as(f32, @floatFromInt(fb_extent.height))
+            else
+                @as(f32, @floatFromInt(fb_extent.height)),
+            .min_depth = 0,
+            .max_depth = 1,
+        };
+        const scissor = vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = fb_extent };
+        gc.vkd.cmdSetViewport(cmdbuf, 0, 1, @as([*]const vk.Viewport, @ptrCast(&viewport)));
+        gc.vkd.cmdSetScissor(cmdbuf, 0, 1, @as([*]const vk.Rect2D, @ptrCast(&scissor)));
+
+        const clear_color = vk.ClearValue{ .color = .{ .float_32 = .{ 0.05, 0.05, 0.07, 1.0 } } };
+        const clear_depth = vk.ClearValue{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } };
+        var clears = [_]vk.ClearValue{ clear_color, clear_depth };
+
+        const rp_begin = vk.RenderPassBeginInfo{
+            .render_pass = render_pass,
+            .framebuffer = framebuffers[swapchain.image_index],
+            .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = fb_extent },
+            .clear_value_count = @intCast(clears.len),
+            .p_clear_values = &clears,
+        };
+        gc.vkd.cmdBeginRenderPass(cmdbuf, &rp_begin, vk.SubpassContents.@"inline");
+
+        gc.vkd.cmdBindPipeline(cmdbuf, .graphics, pipeline);
+        const offsets = [_]vk.DeviceSize{0};
+        gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @as([*]const vk.Buffer, @ptrCast(&vbuf)), &offsets);
+
+        // Push VP (projection flip only when policy=projection)
+        var vp = camera.viewProjMatrix();
+        if (g_y_policy == .projection) {
+            vp.m[5] = -vp.m[5];
+        }
+        const push = Push{ .m = vp.m };
+        gc.vkd.cmdPushConstants(cmdbuf, pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(Push), @ptrCast(&push));
+
+        gc.vkd.cmdDraw(cmdbuf, TOTAL_VERTICES, 1, 0, 0);
+        gc.vkd.cmdEndRenderPass(cmdbuf);
+        try gc.vkd.endCommandBuffer(cmdbuf);
+
+        const state = swapchain.present(cmdbuf) catch |err| switch (err) {
+            error.OutOfDateKHR => Swapchain.PresentState.suboptimal,
+            else => |narrow| return narrow,
+        };
+
+        // Resize path
+        if (state == .suboptimal) {
+            const fb2 = glfw.getFramebufferSize(window);
+            extent.width = @intCast(@max(@as(i32, 1), fb2.width));
+            extent.height = @intCast(@max(@as(i32, 1), fb2.height));
+            try swapchain.recreate(extent);
+
+            const new_aspect: f32 =
+                @as(f32, @floatFromInt(extent.width)) / @as(f32, @floatFromInt(extent.height));
+            if (comptime @hasField(@TypeOf(camera), "aspect")) camera.aspect = new_aspect;
+
+            destroyFramebuffers(&gc, allocator, framebuffers);
+            destroyDepthResources(&gc, depth);
+            depth = try createDepthResources(&gc, depth_format, swapchain.extent);
+            framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth.view);
+        }
+
+        glfw.pollEvents();
+    }
+
+    try swapchain.waitForAllFences();
+}
+
+// Allocate per-swapchain command buffers once (idempotent helper).
+fn cmdbufsForSwap(gc: *const GraphicsContext, A: Allocator, pool: vk.CommandPool, count: usize) []vk.CommandBuffer {
+    const State = struct {
+        var bufs: ?[]vk.CommandBuffer = null;
+    };
+    if (State.bufs) |b| return b;
+    var bufs = A.alloc(vk.CommandBuffer, count) catch @panic("oom");
+    gc.vkd.allocateCommandBuffers(gc.dev, &vk.CommandBufferAllocateInfo{
+        .command_pool = pool,
+        .level = .primary,
+        .command_buffer_count = @intCast(count),
+    }, bufs.ptr) catch @panic("alloc cmdbufs");
+    State.bufs = bufs;
+    return bufs;
+}
+
+// ── Inline tests
+test "viewport/pipeline policy toggles are mutually exclusive" {
+    try std.testing.expect(@intFromEnum(YPolicy.viewport) != @intFromEnum(YPolicy.projection));
 }
