@@ -17,7 +17,7 @@ const math3d = @import("math3d");
 const Vec3 = math3d.Vec3;
 const Mat4 = math3d.Mat4;
 
-// ── NEW SHADERS: compiled SPIR-V blobs (replace old triangle_* with these compiled files)
+// Optional: present alongside the exe; not directly used in this file.
 const vert_spv = @embedFile("generated/shaders/triangle_vert");
 const frag_spv = @embedFile("generated/shaders/triangle_frag");
 
@@ -50,9 +50,7 @@ const DepthResources = struct {
 };
 
 // Push-constant block (std430 layout, 16*4 bytes)
-const Push = extern struct { // keep it plain 16 f32s
-    m: [16]f32,
-};
+const Push = extern struct { m: [16]f32 };
 
 fn readWholeFile(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const limit: std.Io.Limit = @enumFromInt(max_bytes);
@@ -60,23 +58,18 @@ fn readWholeFile(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) !
 }
 
 fn loadSpirvFromExeDirAligned(alloc: Allocator, rel: []const u8) ![]u8 {
-    // exe_dir/shaders/<file>
     const exe_dir = try std.fs.selfExeDirPathAlloc(alloc);
     defer alloc.free(exe_dir);
 
     const full = try std.fs.path.join(alloc, &.{ exe_dir, rel });
     defer alloc.free(full);
 
-    // read into temp
     var tmp = try readWholeFile(alloc, full, 16 * 1024 * 1024);
-
     defer alloc.free(tmp);
 
     if (tmp.len % 4 != 0) return error.BadSpirvSize;
 
-    // Vulkan wants u32-aligned memory. Make sure our buffer is 4-byte aligned.
     const out = try alloc.alignedAlloc(u8, .@"4", tmp.len);
-
     @memcpy(out, tmp);
     return out;
 }
@@ -222,7 +215,6 @@ fn writeFloorWorld(verts: [*]Vertex) void {
             else
                 .{ 0.20, 0.22, 0.26 };
 
-            // Two triangles
             verts[idx + 0] = .{ .pos = p00, .color = color };
             verts[idx + 1] = .{ .pos = p10, .color = color };
             verts[idx + 2] = .{ .pos = p11, .color = color };
@@ -236,78 +228,6 @@ fn writeFloorWorld(verts: [*]Vertex) void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Frame recording: push constants carry VP to the shader
-// ─────────────────────────────────────────────────────────────────────────────
-fn recordFrame(
-    gc: *const GraphicsContext,
-    cmdbuf: vk.CommandBuffer,
-    fb: vk.Framebuffer,
-    extent: vk.Extent2D,
-    render_pass: vk.RenderPass,
-    pipeline: vk.Pipeline,
-    vbuf: vk.Buffer,
-    vp: Mat4,
-) !void {
-    try gc.vkd.resetCommandBuffer(cmdbuf, .{});
-
-    try gc.vkd.beginCommandBuffer(cmdbuf, &vk.CommandBufferBeginInfo{
-        .flags = .{},
-        .p_inheritance_info = null,
-    });
-
-    var viewport = vk.Viewport{
-        .x = 0,
-        .y = @as(f32, @floatFromInt(extent.height)),
-        .width = @as(f32, @floatFromInt(extent.width)),
-        .height = -@as(f32, @floatFromInt(extent.height)), // Vulkan-up
-        .min_depth = 0,
-        .max_depth = 1,
-    };
-    const scissor = vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
-    gc.vkd.cmdSetViewport(cmdbuf, 0, 1, @as([*]const vk.Viewport, @ptrCast(&viewport)));
-    gc.vkd.cmdSetScissor(cmdbuf, 0, 1, @as([*]const vk.Rect2D, @ptrCast(&scissor)));
-
-    const clear_color = vk.ClearValue{ .color = .{ .float_32 = .{ 0.05, 0.05, 0.07, 1.0 } } };
-    const clear_depth = vk.ClearValue{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } };
-    var clears = [_]vk.ClearValue{ clear_color, clear_depth };
-
-    const rp_begin = vk.RenderPassBeginInfo{
-        .render_pass = render_pass,
-        .framebuffer = fb,
-        .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = extent },
-        .clear_value_count = @intCast(clears.len),
-        .p_clear_values = &clears,
-    };
-    gc.vkd.cmdBeginRenderPass(cmdbuf, &rp_begin, vk.SubpassContents.@"inline");
-
-    gc.vkd.cmdBindPipeline(cmdbuf, .graphics, pipeline);
-    const offsets = [_]vk.DeviceSize{0};
-    gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @as([*]const vk.Buffer, @ptrCast(&vbuf)), &offsets);
-
-    // push constants: 64 bytes
-    const push = Push{ .m = vp.m };
-    gc.vkd.cmdPushConstants(
-        cmdbuf,
-        // same pipeline layout used at create time:
-        // we'll pass it via dynamic state using vkCmdBindPipeline already bound.
-        // Vulkan requires the layout object, not the pipeline, so we store it globally.
-        // We pass it through via a global; but to avoid globals, we will re-create below.
-        // Workaround: we don't have it here, so caller must push constants instead.
-        // We'll fix by threading layout in.
-        // TEMP: no-op (will be replaced by caller)
-        .null_handle,
-        .{ .vertex_bit = true },
-        0,
-        @sizeOf(Push),
-        @ptrCast(&push),
-    );
-
-    gc.vkd.cmdDraw(cmdbuf, TOTAL_VERTICES, 1, 0, 0);
-    gc.vkd.cmdEndRenderPass(cmdbuf);
-    try gc.vkd.endCommandBuffer(cmdbuf);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────────────────────────────────────
 pub fn main() !void {
@@ -315,7 +235,8 @@ pub fn main() !void {
     try glfw.init();
     defer glfw.terminate();
 
-    var extent = vk.Extent2D{ .width = 1280, .height = 800 };
+    // Start with a logical window size; swapchain will pick the real pixel size.
+    var desired_window_extent = vk.Extent2D{ .width = 1280, .height = 800 };
 
     glfw.defaultWindowHints();
     glfw.windowHint(glfw.c.GLFW_CLIENT_API, glfw.c.GLFW_NO_API);
@@ -323,17 +244,17 @@ pub fn main() !void {
     if (glfw.getPrimaryMonitor()) |mon| {
         const wa = glfw.getMonitorWorkarea(mon);
         if (wa.width > 0 and wa.height > 0) {
-            extent.width = @intCast(@divTrunc(wa.width * 3, 4));
-            extent.height = @intCast(@divTrunc(wa.height * 3, 4));
+            desired_window_extent.width = @intCast(@divTrunc(wa.width * 3, 4));
+            desired_window_extent.height = @intCast(@divTrunc(wa.height * 3, 4));
         } else if (glfw.getVideoMode(mon)) |vm| {
-            extent.width = @intCast(@divTrunc(vm.width * 3, 4));
-            extent.height = @intCast(@divTrunc(vm.height * 3, 4));
+            desired_window_extent.width = @intCast(@divTrunc(vm.width * 3, 4));
+            desired_window_extent.height = @intCast(@divTrunc(vm.height * 3, 4));
         }
     }
 
     const window = try glfw.createWindow(
-        @as(i32, @intCast(extent.width)),
-        @as(i32, @intCast(extent.height)),
+        @as(i32, @intCast(desired_window_extent.width)),
+        @as(i32, @intCast(desired_window_extent.height)),
         window_title_cstr,
         null,
         null,
@@ -344,8 +265,14 @@ pub fn main() !void {
     var gc = try GraphicsContext.init(allocator, window_title_cstr, window);
     defer gc.deinit();
 
+    // Use framebuffer pixels (Retina-aware) for the swapchain extent.
+    var extent = gc.framebufferExtent();
+
     var swapchain = try Swapchain.init(&gc, allocator, extent);
     defer swapchain.deinit();
+
+    // Keep local 'extent' synchronized with the swapchain's real extent.
+    extent = swapchain.extent;
 
     // Pipeline layout with push constants (mat4 VP)
     const push_range = vk.PushConstantRange{
@@ -461,25 +388,15 @@ pub fn main() !void {
         // Acquire cmdbuf for current image
         const cmdbuf = cmdbufs[swapchain.image_index];
 
-        // Record draw with current VP
+        // Record draw
         try gc.vkd.resetCommandBuffer(cmdbuf, .{});
-
         try gc.vkd.beginCommandBuffer(cmdbuf, &vk.CommandBufferBeginInfo{
             .flags = .{},
             .p_inheritance_info = null,
         });
 
-        var viewport = vk.Viewport{
-            .x = 0,
-            .y = @as(f32, @floatFromInt(extent.height)),
-            .width = @as(f32, @floatFromInt(extent.width)),
-            .height = -@as(f32, @floatFromInt(extent.height)),
-            .min_depth = 0,
-            .max_depth = 1,
-        };
-        const scissor = vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
-        gc.vkd.cmdSetViewport(cmdbuf, 0, 1, @as([*]const vk.Viewport, @ptrCast(&viewport)));
-        gc.vkd.cmdSetScissor(cmdbuf, 0, 1, @as([*]const vk.Rect2D, @ptrCast(&scissor)));
+        // Viewport/scissor from *actual framebuffer pixels* (fixes Retina)
+        swapchain.cmdSetViewportAndScissor(&gc, cmdbuf);
 
         const clear_color = vk.ClearValue{ .color = .{ .float_32 = .{ 0.05, 0.05, 0.07, 1.0 } } };
         const clear_depth = vk.ClearValue{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } };
@@ -488,7 +405,8 @@ pub fn main() !void {
         const rp_begin = vk.RenderPassBeginInfo{
             .render_pass = render_pass,
             .framebuffer = framebuffers[swapchain.image_index],
-            .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = extent },
+            // Use the swapchain's real extent, not the logical window size.
+            .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = swapchain.extent },
             .clear_value_count = @intCast(clears.len),
             .p_clear_values = &clears,
         };
@@ -499,7 +417,7 @@ pub fn main() !void {
         const offsets = [_]vk.DeviceSize{0};
         gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @as([*]const vk.Buffer, @ptrCast(&vbuf)), &offsets);
 
-        // Push VP
+        // Push VP (aspect already matches pixels)
         const push = Push{ .m = camera.viewProjMatrix().m };
         gc.vkd.cmdPushConstants(cmdbuf, pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(Push), @ptrCast(&push));
 
@@ -507,21 +425,24 @@ pub fn main() !void {
         gc.vkd.cmdEndRenderPass(cmdbuf);
         try gc.vkd.endCommandBuffer(cmdbuf);
 
+        // Present
         const state = swapchain.present(cmdbuf) catch |err| switch (err) {
             error.OutOfDateKHR => Swapchain.PresentState.suboptimal,
             else => |narrow| return narrow,
         };
 
-        if (state == .suboptimal) {
-            const sz = glfw.getWindowSize(window);
-            if (sz.width == 0 or sz.height == 0) {
+        // Handle resize either via suboptimal present or explicit GLFW callback flag.
+        if (state == .suboptimal or gc.takeResizeFlag()) {
+            // Get the current framebuffer size in pixels.
+            const fb = gc.framebufferExtent();
+            if (fb.width == 0 or fb.height == 0) {
                 glfw.pollEvents();
                 continue;
             }
-            extent.width = @intCast(sz.width);
-            extent.height = @intCast(sz.height);
 
-            try swapchain.recreate(extent);
+            // Recreate swapchain & size-dependent resources.
+            try swapchain.recreate(fb);
+            extent = swapchain.extent;
 
             const new_aspect: f32 =
                 @as(f32, @floatFromInt(extent.width)) / @as(f32, @floatFromInt(extent.height));
@@ -581,8 +502,6 @@ fn copyBuffer(
     try gc.vkd.queueWaitIdle(gc.graphics_queue.handle);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Framebuffers / Render pass / Pipeline
 // ─────────────────────────────────────────────────────────────────────────────
 fn createFramebuffers(
     gc: *const GraphicsContext,
@@ -682,14 +601,12 @@ fn createPipeline(
     layout: vk.PipelineLayout,
     render_pass: vk.RenderPass,
 ) !vk.Pipeline {
-    // Load SPIR-V blobs that were installed next to the exe by build.zig:
     const A = std.heap.c_allocator;
     const vert_bytes = try loadSpirvFromExeDirAligned(A, "shaders/triangle_vert");
     defer A.free(vert_bytes);
     const frag_bytes = try loadSpirvFromExeDirAligned(A, "shaders/triangle_frag");
     defer A.free(frag_bytes);
 
-    // Create shader modules
     const vert = try gc.vkd.createShaderModule(gc.dev, &vk.ShaderModuleCreateInfo{
         .flags = .{},
         .code_size = vert_bytes.len,
@@ -762,24 +679,8 @@ fn createPipeline(
         .depth_compare_op = .less,
         .depth_bounds_test_enable = VK_FALSE32,
         .stencil_test_enable = VK_FALSE32,
-        .front = .{
-            .fail_op = .keep,
-            .pass_op = .keep,
-            .depth_fail_op = .keep,
-            .compare_op = .always,
-            .compare_mask = 0,
-            .write_mask = 0,
-            .reference = 0,
-        },
-        .back = .{
-            .fail_op = .keep,
-            .pass_op = .keep,
-            .depth_fail_op = .keep,
-            .compare_op = .always,
-            .compare_mask = 0,
-            .write_mask = 0,
-            .reference = 0,
-        },
+        .front = .{ .fail_op = .keep, .pass_op = .keep, .depth_fail_op = .keep, .compare_op = .always, .compare_mask = 0, .write_mask = 0, .reference = 0 },
+        .back = .{ .fail_op = .keep, .pass_op = .keep, .depth_fail_op = .keep, .compare_op = .always, .compare_mask = 0, .write_mask = 0, .reference = 0 },
         .min_depth_bounds = 0.0,
         .max_depth_bounds = 1.0,
     };

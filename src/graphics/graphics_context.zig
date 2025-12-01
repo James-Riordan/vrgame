@@ -5,28 +5,14 @@ const vk = @import("vulkan");
 
 const Allocator = std.mem.Allocator;
 
-const GetInstanceProc = *const fn (
-    vk.Instance,
-    [*:0]const u8,
-) callconv(.c) vk.PfnVoidFunction;
+const GetInstanceProc = *const fn (vk.Instance, [*:0]const u8) callconv(.c) vk.PfnVoidFunction;
+const GetDeviceProc = *const fn (vk.Device, [*:0]const u8) callconv(.c) vk.PfnVoidFunction;
 
-const GetDeviceProc = *const fn (
-    vk.Device,
-    [*:0]const u8,
-) callconv(.c) vk.PfnVoidFunction;
-
-// Required Vulkan device extensions (C strings, NUL-terminated).
-const required_device_extensions = [_][*:0]const u8{
-    vk.extensions.khr_swapchain.name,
-};
-
-const optional_device_extensions = [_][*:0]const u8{};
-
-// Optional *instance* extensions we try to enable if present.
+// ─────────────────────────────────────────────────────────────────────────────
+// Optional instance extensions (portability on macOS)
+// ─────────────────────────────────────────────────────────────────────────────
 const optional_instance_extensions = blk: {
     if (builtin.os.tag == .macos) {
-        // On macOS+MoltenVK you MUST enable the portability enumeration extension
-        // if you set enumerate_portability_bit_khr on InstanceCreateInfo.flags.
         break :blk [_][*:0]const u8{
             vk.extensions.khr_get_physical_device_properties_2.name,
             vk.extensions.khr_portability_enumeration.name,
@@ -38,26 +24,41 @@ const optional_instance_extensions = blk: {
     }
 };
 
-// Modern vulkan-zig: wrappers are already monomorphized types.
-// No more vk.BaseWrapper(apis) – we just alias the types.
+// Device extensions
+const required_device_extensions = [_][*:0]const u8{
+    vk.extensions.khr_swapchain.name,
+};
+const optional_device_extensions = [_][*:0]const u8{};
+
+// Dispatch aliases (modern vulkan-zig)
 const BaseDispatch = vk.BaseWrapper;
 const InstanceDispatch = vk.InstanceWrapper;
 const DeviceDispatch = vk.DeviceWrapper;
 
+// Module-scope flag toggled by GLFW framebuffer callback
+var g_need_swapchain_recreate: bool = false;
+
 pub const GraphicsContext = struct {
+    // Vulkan dispatchers
     vkb: BaseDispatch,
     vki: InstanceDispatch,
     vkd: DeviceDispatch,
 
+    // Core handles
     instance: vk.Instance,
     surface: vk.SurfaceKHR,
     pdev: vk.PhysicalDevice,
     props: vk.PhysicalDeviceProperties,
     mem_props: vk.PhysicalDeviceMemoryProperties,
-
     dev: vk.Device,
+
+    // Queues
     graphics_queue: Queue,
     present_queue: Queue,
+
+    // Keep the window so we can query framebuffer pixels
+    window: *glfw.Window,
+    resize_requested: bool = false,
 
     pub fn init(
         allocator: Allocator,
@@ -65,35 +66,24 @@ pub const GraphicsContext = struct {
         window: *glfw.Window,
     ) !GraphicsContext {
         var self: GraphicsContext = undefined;
+        self.window = window;
 
-        // ── Base dispatch: use a shim that adapts glfw-zig's loader
-        //    to vulkan-zig's expected signature.
+        // Base dispatch via GLFW proc adapter
         const get_proc: GetInstanceProc = glfwGetInstanceProc;
         self.vkb = BaseDispatch.load(get_proc);
 
-        // ─────────────────────────────────────────────────────────────
-        // Instance extensions via GLFW (this part stays as you have it)
-        // ─────────────────────────────────────────────────────────────
-
+        // Instance extensions (GLFW + optional)
         const glfw_exts_opt = glfw.getRequiredInstanceExtensions(allocator) catch |err| {
-            if (glfw.getLastError()) |err_info| {
-                const code_opt = glfw.errorCodeFromC(err_info.code);
-                const code_str = if (code_opt) |ce| @tagName(ce) else "UnknownError";
-
-                const desc_str: []const u8 = err_info.description orelse "no description";
-                std.log.err(
-                    "failed to get required Vulkan instance extensions via GLFW: {s}: {s}",
-                    .{ code_str, desc_str },
-                );
+            if (glfw.getLastError()) |info| {
+                const code_opt = glfw.errorCodeFromC(info.code);
+                const code_str = if (code_opt) |c| @tagName(c) else "UnknownError";
+                const desc_str: []const u8 = info.description orelse "no description";
+                std.log.err("GLFW Vulkan extensions failed: {s}: {s}", .{ code_str, desc_str });
             } else {
-                std.log.err(
-                    "failed to get required Vulkan instance extensions via GLFW (no error info): {s}",
-                    .{@errorName(err)},
-                );
+                std.log.err("GLFW Vulkan extensions failed: {s}", .{@errorName(err)});
             }
             return error.VulkanInstanceExtensionsQueryFailed;
         };
-
         const glfw_exts = glfw_exts_opt orelse {
             std.log.err("GLFW reported no required Vulkan instance extensions", .{});
             return error.VulkanInstanceExtensionsMissing;
@@ -109,23 +99,17 @@ pub const GraphicsContext = struct {
             try instance_extensions.append(allocator, ext_name_z.ptr);
         }
 
-        var count: u32 = 0;
-        _ = try self.vkb.enumerateInstanceExtensionProperties(null, &count, null);
-
-        const propsv = try allocator.alloc(vk.ExtensionProperties, count);
+        var ext_count: u32 = 0;
+        _ = try self.vkb.enumerateInstanceExtensionProperties(null, &ext_count, null);
+        const propsv = try allocator.alloc(vk.ExtensionProperties, ext_count);
         defer allocator.free(propsv);
-
-        _ = try self.vkb.enumerateInstanceExtensionProperties(null, &count, propsv.ptr);
+        _ = try self.vkb.enumerateInstanceExtensionProperties(null, &ext_count, propsv.ptr);
 
         for (optional_instance_extensions) |ext_name| {
-            const ext_span = std.mem.span(ext_name);
-
-            for (propsv) |prop| {
-                const name_len =
-                    std.mem.indexOfScalar(u8, &prop.extension_name, 0) orelse prop.extension_name.len;
-                const prop_name = prop.extension_name[0..name_len];
-
-                if (std.mem.eql(u8, prop_name, ext_span)) {
+            const want = std.mem.span(ext_name);
+            for (propsv) |p| {
+                const nlen = std.mem.indexOfScalar(u8, &p.extension_name, 0) orelse p.extension_name.len;
+                if (std.mem.eql(u8, p.extension_name[0..nlen], want)) {
                     try instance_extensions.append(allocator, ext_name);
                     break;
                 }
@@ -144,8 +128,7 @@ pub const GraphicsContext = struct {
         };
 
         const enabled_ext_count: u32 = @intCast(instance_extensions.items.len);
-        const enabled_ext_ptr: [*]const [*:0]const u8 =
-            @ptrCast(instance_extensions.items.ptr);
+        const enabled_ext_ptr: [*]const [*:0]const u8 = @ptrCast(instance_extensions.items.ptr);
 
         self.instance = try self.vkb.createInstance(&vk.InstanceCreateInfo{
             .flags = if (builtin.os.tag == .macos)
@@ -159,7 +142,7 @@ pub const GraphicsContext = struct {
             .pp_enabled_extension_names = enabled_ext_ptr,
         }, null);
 
-        // ── Instance dispatch: unwrap the optional vkGetInstanceProcAddr
+        // Instance/device dispatch
         const get_inst_proc: GetInstanceProc = self.vkb.dispatch.vkGetInstanceProcAddr.?;
         self.vki = InstanceDispatch.load(self.instance, get_inst_proc);
         errdefer self.vki.destroyInstance(self.instance, null);
@@ -172,10 +155,8 @@ pub const GraphicsContext = struct {
         self.props = candidate.props;
 
         self.dev = try initializeCandidate(allocator, self.vki, candidate);
-
         const get_dev_proc: GetDeviceProc = self.vki.dispatch.vkGetDeviceProcAddr.?;
         self.vkd = DeviceDispatch.load(self.dev, get_dev_proc);
-
         errdefer self.vkd.destroyDevice(self.dev, null);
 
         self.graphics_queue = Queue.init(self.vkd, self.dev, candidate.queues.graphics_family);
@@ -183,356 +164,220 @@ pub const GraphicsContext = struct {
 
         self.mem_props = self.vki.getPhysicalDeviceMemoryProperties(self.pdev);
 
+        // Install framebuffer resize callback (sets a module-scope flag)
+        self.installFramebufferResizeCallback();
+
         return self;
     }
 
     pub fn deinit(self: GraphicsContext) void {
-        // Best practice: ensure all work is complete before destruction.
-        // Ignore the result – if it fails, we’re shutting down anyway.
         _ = self.vkd.deviceWaitIdle(self.dev) catch {};
-
         self.vkd.destroyDevice(self.dev, null);
         self.vki.destroySurfaceKHR(self.instance, self.surface, null);
         self.vki.destroyInstance(self.instance, null);
     }
 
-    pub fn deviceName(self: *const GraphicsContext) []const u8 {
-        // Take the fixed-size buffer as a slice…
-        const buf: []const u8 = self.props.device_name[0..];
-        // …and cut at the first NUL byte (C string terminator).
-        return std.mem.sliceTo(buf, 0);
+    /// Width/height in **framebuffer pixels** (Retina-aware).
+    pub fn framebufferExtent(self: *const GraphicsContext) vk.Extent2D {
+        const fb = glfw.getFramebufferSize(self.window);
+        const w: i32 = if (fb.width < 1) 1 else fb.width;
+        const h: i32 = if (fb.height < 1) 1 else fb.height;
+        return .{ .width = @intCast(w), .height = @intCast(h) };
     }
 
-    pub fn findMemoryTypeIndex(
-        self: GraphicsContext,
-        memory_type_bits: u32,
-        flags: vk.MemoryPropertyFlags,
-    ) !u32 {
-        for (
-            self.mem_props.memory_types[0..self.mem_props.memory_type_count],
-            0..,
-        ) |mem_type, i| {
-            const idx_u5: u5 = @truncate(i);
-            const bit: u32 = @as(u32, 1) << idx_u5;
+    /// Returns true once when the OS reports framebuffer size change.
+    pub fn takeResizeFlag(_: *GraphicsContext) bool {
+        const r = g_need_swapchain_recreate;
+        g_need_swapchain_recreate = false;
+        return r;
+    }
 
-            if (memory_type_bits & bit != 0 and mem_type.property_flags.contains(flags)) {
-                return @as(u32, @truncate(i));
-            }
+    pub fn installFramebufferResizeCallback(self: *GraphicsContext) void {
+        glfw.setWindowUserPointer(self.window, self);
+        _ = glfw.setFramebufferSizeCallback(self.window, framebufferSizeChanged);
+    }
+
+    pub fn deviceName(self: *const GraphicsContext) []const u8 {
+        return std.mem.sliceTo(self.props.device_name[0..], 0);
+    }
+
+    pub fn findMemoryTypeIndex(self: GraphicsContext, memory_type_bits: u32, flags: vk.MemoryPropertyFlags) !u32 {
+        for (self.mem_props.memory_types[0..self.mem_props.memory_type_count], 0..) |mem_type, i| {
+            const bit: u32 = (@as(u32, 1)) << @as(u5, @truncate(i));
+            if (memory_type_bits & bit != 0 and mem_type.property_flags.contains(flags))
+                return @intCast(i);
         }
-
         return error.NoSuitableMemoryType;
     }
 
-    pub fn allocate(
-        self: GraphicsContext,
-        requirements: vk.MemoryRequirements,
-        flags: vk.MemoryPropertyFlags,
-    ) !vk.DeviceMemory {
+    pub fn allocate(self: GraphicsContext, reqs: vk.MemoryRequirements, flags: vk.MemoryPropertyFlags) !vk.DeviceMemory {
         return try self.vkd.allocateMemory(self.dev, &.{
-            .allocation_size = requirements.size,
-            .memory_type_index = try self.findMemoryTypeIndex(
-                requirements.memory_type_bits,
-                flags,
-            ),
+            .allocation_size = reqs.size,
+            .memory_type_index = try self.findMemoryTypeIndex(reqs.memory_type_bits, flags),
         }, null);
     }
 };
 
+// ── Queues ───────────────────────────────────────────────────────────────────
 pub const Queue = struct {
     handle: vk.Queue,
     family: u32,
-
     fn init(vkd: DeviceDispatch, dev: vk.Device, family: u32) Queue {
-        return .{
-            .handle = vkd.getDeviceQueue(dev, family, 0),
-            .family = family,
-        };
+        return .{ .handle = vkd.getDeviceQueue(dev, family, 0), .family = family };
     }
 };
 
-fn glfwGetInstanceProc(
-    instance: vk.Instance,
-    name: [*:0]const u8,
-) callconv(.c) vk.PfnVoidFunction {
-    // Convert vk.Instance (enum(usize)) to the pointer-like VkInstance that
-    // GLFW expects in its C API.
+// ── GLFW proc adapter ─────────────────────────────────────────────────────────
+fn glfwGetInstanceProc(instance: vk.Instance, name: [*:0]const u8) callconv(.c) vk.PfnVoidFunction {
     const opaque_instance: ?*anyopaque = blk: {
         if (instance == .null_handle) break :blk null;
-
-        const bits: usize = @intFromEnum(instance);
-        break :blk @ptrFromInt(bits);
+        break :blk @ptrFromInt(@intFromEnum(instance));
     };
-
-    // Vulkan expects zero-terminated ASCII; glfw-zig’s API takes [:0]const u8.
     const name_slice: [:0]const u8 = std.mem.span(name);
-
-    // glfw.VkProc == GLFWvkproc == optional raw function pointer.
     const raw: glfw.VkProc = glfw.getInstanceProcAddress(opaque_instance, name_slice);
-
-    if (raw) |p| {
-        // Convert GLFW’s proc pointer type into Vulkan’s PfnVoidFunction.
-        return @ptrCast(p);
-    }
-
+    if (raw) |p| return @ptrCast(p);
     return null;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Surface creation (GLFW → VkSurfaceKHR)
-// ─────────────────────────────────────────────────────────────────────────────
-
-extern fn glfwCreateWindowSurface(
-    instance: vk.Instance,
-    window: *glfw.Window,
-    allocator: ?*const anyopaque,
-    surface: *vk.SurfaceKHR,
-) vk.Result;
+// ── Surface creation (GLFW → VkSurfaceKHR) ───────────────────────────────────
+extern fn glfwCreateWindowSurface(instance: vk.Instance, window: *glfw.Window, allocator: ?*const anyopaque, surface: *vk.SurfaceKHR) vk.Result;
 
 fn createSurface(instance: vk.Instance, window: *glfw.Window) !vk.SurfaceKHR {
     var surface: vk.SurfaceKHR = undefined;
-
-    const res: vk.Result = glfwCreateWindowSurface(
-        instance,
-        window,
-        null,
-        &surface,
-    );
-
+    const res = glfwCreateWindowSurface(instance, window, null, &surface);
     if (res != .success) return error.SurfaceInitFailed;
     return surface;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Device selection, queue allocation, extension checks
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Device selection, queues, extensions ─────────────────────────────────────
+const DeviceCandidate = struct { pdev: vk.PhysicalDevice, props: vk.PhysicalDeviceProperties, queues: QueueAllocation };
+const QueueAllocation = struct { graphics_family: u32, present_family: u32 };
 
-const DeviceCandidate = struct {
-    pdev: vk.PhysicalDevice,
-    props: vk.PhysicalDeviceProperties,
-    queues: QueueAllocation,
-};
-
-const QueueAllocation = struct {
-    graphics_family: u32,
-    present_family: u32,
-};
-
-fn pickPhysicalDevice(
-    vki: InstanceDispatch,
-    instance: vk.Instance,
-    allocator: Allocator,
-    surface: vk.SurfaceKHR,
-) !DeviceCandidate {
-    var device_count: u32 = 0;
-    _ = try vki.enumeratePhysicalDevices(instance, &device_count, null);
-
-    const pdevs = try allocator.alloc(vk.PhysicalDevice, device_count);
+fn pickPhysicalDevice(vki: InstanceDispatch, instance: vk.Instance, allocator: Allocator, surface: vk.SurfaceKHR) !DeviceCandidate {
+    var n: u32 = 0;
+    _ = try vki.enumeratePhysicalDevices(instance, &n, null);
+    const pdevs = try allocator.alloc(vk.PhysicalDevice, n);
     defer allocator.free(pdevs);
-
-    _ = try vki.enumeratePhysicalDevices(instance, &device_count, pdevs.ptr);
+    _ = try vki.enumeratePhysicalDevices(instance, &n, pdevs.ptr);
 
     for (pdevs) |pdev| {
-        if (try checkSuitable(vki, pdev, allocator, surface)) |candidate| {
-            return candidate;
-        }
+        if (try checkSuitable(vki, pdev, allocator, surface)) |c| return c;
     }
-
     return error.NoSuitableDevice;
 }
 
-fn checkSuitable(
-    vki: InstanceDispatch,
-    pdev: vk.PhysicalDevice,
-    allocator: Allocator,
-    surface: vk.SurfaceKHR,
-) !?DeviceCandidate {
+fn checkSuitable(vki: InstanceDispatch, pdev: vk.PhysicalDevice, allocator: Allocator, surface: vk.SurfaceKHR) !?DeviceCandidate {
     const props = vki.getPhysicalDeviceProperties(pdev);
-
-    if (!try checkExtensionSupport(vki, pdev, allocator)) {
-        return null;
+    if (!try checkExtensionSupport(vki, pdev, allocator)) return null;
+    if (!try checkSurfaceSupport(vki, pdev, surface)) return null;
+    if (try allocateQueues(vki, pdev, allocator, surface)) |q| {
+        return .{ .pdev = pdev, .props = props, .queues = q };
     }
-
-    if (!try checkSurfaceSupport(vki, pdev, surface)) {
-        return null;
-    }
-
-    if (try allocateQueues(vki, pdev, allocator, surface)) |allocation| {
-        return DeviceCandidate{
-            .pdev = pdev,
-            .props = props,
-            .queues = allocation,
-        };
-    }
-
     return null;
 }
 
-fn allocateQueues(
-    vki: InstanceDispatch,
-    pdev: vk.PhysicalDevice,
-    allocator: Allocator,
-    surface: vk.SurfaceKHR,
-) !?QueueAllocation {
-    var family_count: u32 = 0;
-    vki.getPhysicalDeviceQueueFamilyProperties(pdev, &family_count, null);
-
-    const families = try allocator.alloc(vk.QueueFamilyProperties, family_count);
-    defer allocator.free(families);
-
-    vki.getPhysicalDeviceQueueFamilyProperties(pdev, &family_count, families.ptr);
-
-    var graphics_family: ?u32 = null;
-    var present_family: ?u32 = null;
-
-    for (families, 0..) |properties, i| {
-        const family: u32 = @intCast(i);
-
-        if (graphics_family == null and properties.queue_flags.graphics_bit) {
-            graphics_family = family;
-        }
-
-        if (present_family == null) {
-            const support: vk.Bool32 =
-                try vki.getPhysicalDeviceSurfaceSupportKHR(pdev, family, surface);
-
-            // Bool32 is an enum(i32); treat non-zero as "true".
-            if (@intFromEnum(support) != 0) {
-                present_family = family;
-            }
-        }
-    }
-
-    if (graphics_family != null and present_family != null) {
-        return QueueAllocation{
-            .graphics_family = graphics_family.?,
-            .present_family = present_family.?,
-        };
-    }
-
-    return null;
-}
-
-fn checkSurfaceSupport(
-    vki: InstanceDispatch,
-    pdev: vk.PhysicalDevice,
-    surface: vk.SurfaceKHR,
-) !bool {
-    var format_count: u32 = 0;
-    _ = try vki.getPhysicalDeviceSurfaceFormatsKHR(pdev, surface, &format_count, null);
-
-    var present_mode_count: u32 = 0;
-    _ = try vki.getPhysicalDeviceSurfacePresentModesKHR(
-        pdev,
-        surface,
-        &present_mode_count,
-        null,
-    );
-
-    return format_count > 0 and present_mode_count > 0;
-}
-
-fn checkExtensionSupport(
-    vki: InstanceDispatch,
-    pdev: vk.PhysicalDevice,
-    allocator: Allocator,
-) !bool {
+fn allocateQueues(vki: InstanceDispatch, pdev: vk.PhysicalDevice, allocator: Allocator, surface: vk.SurfaceKHR) !?QueueAllocation {
     var count: u32 = 0;
-    _ = try vki.enumerateDeviceExtensionProperties(pdev, null, &count, null);
+    vki.getPhysicalDeviceQueueFamilyProperties(pdev, &count, null);
+    const families = try allocator.alloc(vk.QueueFamilyProperties, count);
+    defer allocator.free(families);
+    vki.getPhysicalDeviceQueueFamilyProperties(pdev, &count, families.ptr);
 
-    const propsv = try allocator.alloc(vk.ExtensionProperties, count);
+    var gfx: ?u32 = null;
+    var prs: ?u32 = null;
+
+    for (families, 0..) |props, i| {
+        const idx: u32 = @intCast(i);
+        if (gfx == null and props.queue_flags.graphics_bit) gfx = idx;
+
+        if (prs == null) {
+            const s: vk.Bool32 = try vki.getPhysicalDeviceSurfaceSupportKHR(pdev, idx, surface);
+            if (@intFromEnum(s) != 0) prs = idx;
+        }
+    }
+
+    if (gfx != null and prs != null) return .{ .graphics_family = gfx.?, .present_family = prs.? };
+    return null;
+}
+
+fn checkSurfaceSupport(vki: InstanceDispatch, pdev: vk.PhysicalDevice, surface: vk.SurfaceKHR) !bool {
+    var f: u32 = 0;
+    _ = try vki.getPhysicalDeviceSurfaceFormatsKHR(pdev, surface, &f, null);
+    var m: u32 = 0;
+    _ = try vki.getPhysicalDeviceSurfacePresentModesKHR(pdev, surface, &m, null);
+    return f > 0 and m > 0;
+}
+
+fn checkExtensionSupport(vki: InstanceDispatch, pdev: vk.PhysicalDevice, allocator: Allocator) !bool {
+    var n: u32 = 0;
+    _ = try vki.enumerateDeviceExtensionProperties(pdev, null, &n, null);
+    const propsv = try allocator.alloc(vk.ExtensionProperties, n);
     defer allocator.free(propsv);
+    _ = try vki.enumerateDeviceExtensionProperties(pdev, null, &n, propsv.ptr);
 
-    _ = try vki.enumerateDeviceExtensionProperties(pdev, null, &count, propsv.ptr);
-
-    // Ensure all required_device_extensions are present.
     for (required_device_extensions) |ext_name| {
-        const ext_span = std.mem.span(ext_name);
+        const want = std.mem.span(ext_name);
         var found = false;
-
-        for (propsv) |props| {
-            const len =
-                std.mem.indexOfScalar(u8, &props.extension_name, 0) orelse props.extension_name.len;
-            const prop_name = props.extension_name[0..len];
-            if (std.mem.eql(u8, prop_name, ext_span)) {
+        for (propsv) |p| {
+            const len = std.mem.indexOfScalar(u8, &p.extension_name, 0) orelse p.extension_name.len;
+            if (std.mem.eql(u8, p.extension_name[0..len], want)) {
                 found = true;
                 break;
             }
         }
-
         if (!found) return false;
     }
-
     return true;
 }
 
-// initializeCandidate stays mostly unchanged, but uses the device_extensions
-// ArrayList([*:0]const u8) and passes ptrs to Vulkan in a type-correct way.
-fn initializeCandidate(
-    allocator: Allocator,
-    vki: InstanceDispatch,
-    candidate: DeviceCandidate,
-) !vk.Device {
+fn initializeCandidate(allocator: Allocator, vki: InstanceDispatch, cand: DeviceCandidate) !vk.Device {
     const priority = [_]f32{1.0};
-
     const qci = [_]vk.DeviceQueueCreateInfo{
-        .{
-            .flags = .{},
-            .queue_family_index = candidate.queues.graphics_family,
-            .queue_count = 1,
-            .p_queue_priorities = &priority,
-        },
-        .{
-            .flags = .{},
-            .queue_family_index = candidate.queues.present_family,
-            .queue_count = 1,
-            .p_queue_priorities = &priority,
-        },
+        .{ .flags = .{}, .queue_family_index = cand.queues.graphics_family, .queue_count = 1, .p_queue_priorities = &priority },
+        .{ .flags = .{}, .queue_family_index = cand.queues.present_family, .queue_count = 1, .p_queue_priorities = &priority },
     };
+    const queue_count: u32 = if (cand.queues.graphics_family == cand.queues.present_family) 1 else 2;
 
-    const queue_count: u32 = if (candidate.queues.graphics_family == candidate.queues.present_family)
-        1 // NVIDIA
-    else
-        2; // AMD / split queues
+    var dev_exts = try std.ArrayList([*:0]const u8).initCapacity(allocator, required_device_extensions.len);
+    defer dev_exts.deinit(allocator);
+    try dev_exts.appendSlice(allocator, required_device_extensions[0..]);
 
-    var device_extensions = try std.ArrayList([*:0]const u8).initCapacity(
-        allocator,
-        required_device_extensions.len,
-    );
-    defer device_extensions.deinit(allocator);
-
-    try device_extensions.appendSlice(allocator, required_device_extensions[0..]);
-
-    var count: u32 = 0;
-    _ = try vki.enumerateDeviceExtensionProperties(candidate.pdev, null, &count, null);
-
-    const propsv = try allocator.alloc(vk.ExtensionProperties, count);
+    // Optionals per device (safe no-op if missing)
+    var n: u32 = 0;
+    _ = try vki.enumerateDeviceExtensionProperties(cand.pdev, null, &n, null);
+    const propsv = try allocator.alloc(vk.ExtensionProperties, n);
     defer allocator.free(propsv);
+    _ = try vki.enumerateDeviceExtensionProperties(cand.pdev, null, &n, propsv.ptr);
 
-    _ = try vki.enumerateDeviceExtensionProperties(candidate.pdev, null, &count, propsv.ptr);
-
-    for (optional_device_extensions) |extension_name| {
-        const ext_span = std.mem.span(extension_name);
-
-        for (propsv) |prop| {
-            const len =
-                std.mem.indexOfScalar(u8, &prop.extension_name, 0) orelse prop.extension_name.len;
-            const prop_ext_name = prop.extension_name[0..len];
-
-            if (std.mem.eql(u8, prop_ext_name, ext_span)) {
-                try device_extensions.append(allocator, extension_name);
+    for (optional_device_extensions) |name| {
+        const want = std.mem.span(name);
+        for (propsv) |p| {
+            const len = std.mem.indexOfScalar(u8, &p.extension_name, 0) orelse p.extension_name.len;
+            if (std.mem.eql(u8, p.extension_name[0..len], want)) {
+                try dev_exts.append(allocator, name);
                 break;
             }
         }
     }
 
-    return try vki.createDevice(candidate.pdev, &.{
+    return try vki.createDevice(cand.pdev, &.{
         .flags = .{},
         .queue_create_info_count = queue_count,
         .p_queue_create_infos = &qci,
         .enabled_layer_count = 0,
         .pp_enabled_layer_names = undefined,
-        .enabled_extension_count = @as(u32, @intCast(device_extensions.items.len)),
-        .pp_enabled_extension_names = @as([*]const [*:0]const u8, @ptrCast(device_extensions.items.ptr)),
+        .enabled_extension_count = @intCast(dev_exts.items.len),
+        .pp_enabled_extension_names = @as([*]const [*:0]const u8, @ptrCast(dev_exts.items.ptr)),
         .p_enabled_features = null,
     }, null);
+}
+
+// GLFW callback → set the module-scope flag
+fn framebufferSizeChanged(win: ?*glfw.Window, _: c_int, _: c_int) callconv(.c) void {
+    if (win) |w| {
+        if (glfw.getWindowUserPointer(w)) |p| {
+            const gc: *GraphicsContext = @ptrCast(@alignCast(p));
+            gc.resize_requested = true;
+        }
+    }
 }
