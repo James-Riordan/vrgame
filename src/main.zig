@@ -46,16 +46,9 @@ const Push = extern struct { model: [16]f32 };
 // Camera UBO
 const CameraUBO = extern struct { vp: [16]f32 };
 
-// ── Y-flip mode (runtime-switchable; default = viewport flip everywhere)
-const FlipMode = enum { viewport, projection };
-var y_flip_mode: FlipMode = .viewport;
-
-inline fn useViewportFlip() bool {
-    return y_flip_mode == .viewport;
-}
-inline fn useProjectionFlip() bool {
-    return y_flip_mode == .projection;
-}
+// ── Y-flip policy: always flip via negative viewport height (portable & correct)
+const VIEWPORT_Y_FLIP: bool = true;
+const PROJECTION_Y_FLIP: bool = false;
 
 // ── Clock helpers
 fn nowMsFromGlfw() i64 {
@@ -391,7 +384,7 @@ fn createPipeline(gc: *const GraphicsContext, layout: vk.PipelineLayout, render_
         .flags = .{},
         .vertex_binding_description_count = 1,
         .p_vertex_binding_descriptions = @as([*]const vk.VertexInputBindingDescription, @ptrCast(&Vertex.binding_description)),
-        .vertex_attribute_description_count = Vertex.attribute_description.len,
+        .vertex_attribute_description_count = @intCast(Vertex.attribute_description.len),
         .p_vertex_attribute_descriptions = @as([*]const vk.VertexInputAttributeDescription, @ptrCast(&Vertex.attribute_description)),
     };
 
@@ -414,7 +407,7 @@ fn createPipeline(gc: *const GraphicsContext, layout: vk.PipelineLayout, render_
         .depth_clamp_enable = VK_FALSE32,
         .rasterizer_discard_enable = VK_FALSE32,
         .polygon_mode = .fill,
-        .cull_mode = .{},
+        .cull_mode = .{}, // no culling; winding unaffected by viewport flip
         .front_face = .clockwise,
         .depth_bias_enable = VK_FALSE32,
         .depth_bias_constant_factor = 0,
@@ -553,62 +546,68 @@ fn writeUnitCube(verts: []Vertex) void {
     const z0: f32 = -0.5;
     const z1: f32 = 0.5;
 
+    // +Y (top)
     var n = [3]f32{ 0, 1, 0 };
     const top = [_][3]f32{
         .{ x0, 1, z0 }, .{ x1, 1, z0 }, .{ x1, 1, z1 },
         .{ x0, 1, z0 }, .{ x1, 1, z1 }, .{ x0, 1, z1 },
     };
-    inline for (top) |p| {
+    for (top) |p| {
         verts[i] = .{ .pos = p, .normal = n, .color = c_top };
         i += 1;
     }
 
+    // -Y (bottom)
     n = .{ 0, -1, 0 };
     const bot = [_][3]f32{
         .{ x0, 0, z1 }, .{ x1, 0, z1 }, .{ x1, 0, z0 },
         .{ x0, 0, z1 }, .{ x1, 0, z0 }, .{ x0, 0, z0 },
     };
-    inline for (bot) |p| {
+    for (bot) |p| {
         verts[i] = .{ .pos = p, .normal = n, .color = c_side };
         i += 1;
     }
 
+    // +X
     n = .{ 1, 0, 0 };
     const px = [_][3]f32{
         .{ x1, 0, z0 }, .{ x1, 1, z0 }, .{ x1, 1, z1 },
         .{ x1, 0, z0 }, .{ x1, 1, z1 }, .{ x1, 0, z1 },
     };
-    inline for (px) |p| {
+    for (px) |p| {
         verts[i] = .{ .pos = p, .normal = n, .color = c_side };
         i += 1;
     }
 
+    // -X
     n = .{ -1, 0, 0 };
     const nx = [_][3]f32{
         .{ x0, 0, z1 }, .{ x0, 1, z1 }, .{ x0, 1, z0 },
         .{ x0, 0, z1 }, .{ x0, 1, z0 }, .{ x0, 0, z0 },
     };
-    inline for (nx) |p| {
+    for (nx) |p| {
         verts[i] = .{ .pos = p, .normal = n, .color = c_side };
         i += 1;
     }
 
+    // +Z
     n = .{ 0, 0, 1 };
     const pz = [_][3]f32{
         .{ x0, 0, z1 }, .{ x1, 0, z1 }, .{ x1, 1, z1 },
         .{ x0, 0, z1 }, .{ x1, 1, z1 }, .{ x0, 1, z1 },
     };
-    inline for (pz) |p| {
+    for (pz) |p| {
         verts[i] = .{ .pos = p, .normal = n, .color = c_side };
         i += 1;
     }
 
+    // -Z
     n = .{ 0, 0, -1 };
     const nz = [_][3]f32{
         .{ x1, 0, z0 }, .{ x0, 0, z0 }, .{ x0, 1, z0 },
         .{ x1, 0, z0 }, .{ x0, 1, z0 }, .{ x1, 1, z0 },
     };
-    inline for (nz) |p| {
+    for (nz) |p| {
         verts[i] = .{ .pos = p, .normal = n, .color = c_side };
         i += 1;
     }
@@ -831,30 +830,15 @@ pub fn main() !void {
     // Lazy-allocated command buffers (cached)
     const cmdbufs = cmdbufsForSwap(&gc, allocator, cmd_pool, framebuffers.len);
 
-    // F6 edge detector for flip-mode toggle
-    var f6_was_down = false;
-
     while (!glfw.windowShouldClose(window)) {
-        // Toggle Y-flip mode on F6 press
-        const f6 = glfw.getKey(window, glfw.c.GLFW_KEY_F6);
-        const f6_down = (f6 == glfw.c.GLFW_PRESS);
-        if (f6_down and !f6_was_down) {
-            y_flip_mode = if (y_flip_mode == .viewport) .projection else .viewport;
-        }
-        f6_was_down = f6_down;
-
         const tick = frame_timer.tick(nowMsFromGlfw());
         var dt = @as(f32, @floatCast(tick.dt));
         if (tick.fps_updated) {
             var buf: [200]u8 = undefined;
-            const mode = switch (y_flip_mode) {
-                .viewport => "viewport",
-                .projection => "projection",
-            };
             const title = std.fmt.bufPrintZ(
                 &buf,
-                "{s} | FPS: {d:.1} | Cam: x={d:.2}, y={d:.2}, z={d:.2} | Y: {s} (F6)",
-                .{ window_title_base, tick.fps, camera.position.x, camera.position.y, camera.position.z, mode },
+                "{s} | FPS: {d:.1} | Cam: x={d:.2}, y={d:.2}, z={d:.2}",
+                .{ window_title_base, tick.fps, camera.position.x, camera.position.y, camera.position.z },
             ) catch null;
             if (title) |z| glfw.setWindowTitle(window, z);
         }
@@ -871,9 +855,9 @@ pub fn main() !void {
         const input = sampleCameraInput(window);
         camera.update(dt, input);
 
-        // Update UBO (VP); apply projection flip if that mode is active.
+        // Update UBO (VP); projection unchanged (flip handled by viewport).
         var vp = camera.viewProjMatrix();
-        if (useProjectionFlip()) vp.m[5] = -vp.m[5];
+        if (PROJECTION_Y_FLIP) vp.m[5] = -vp.m[5];
         {
             const ptr = try gc.vkd.mapMemory(gc.dev, ubo_mem, 0, vk.WHOLE_SIZE, .{});
             defer gc.vkd.unmapMemory(gc.dev, ubo_mem);
@@ -890,9 +874,9 @@ pub fn main() !void {
 
         var viewport = vk.Viewport{
             .x = 0,
-            .y = if (useViewportFlip()) @as(f32, @floatFromInt(fb_extent.height)) else 0,
+            .y = if (VIEWPORT_Y_FLIP) @as(f32, @floatFromInt(fb_extent.height)) else 0,
             .width = @as(f32, @floatFromInt(fb_extent.width)),
-            .height = if (useViewportFlip())
+            .height = if (VIEWPORT_Y_FLIP)
                 -@as(f32, @floatFromInt(fb_extent.height))
             else
                 @as(f32, @floatFromInt(fb_extent.height)),
@@ -971,7 +955,7 @@ pub fn main() !void {
     try swapchain.waitForAllFences();
 }
 
-// ── Inline sanity tests
-test "Y-flip modes are exclusive" {
-    try std.testing.expect(useViewportFlip() != useProjectionFlip());
+// ── Sanity test
+test "viewport flip is sole active mode" {
+    try std.testing.expect(VIEWPORT_Y_FLIP and !PROJECTION_Y_FLIP);
 }
