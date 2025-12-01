@@ -24,6 +24,7 @@ test {
     _ = @import("integration/frame_time_public_decls.zig");
     _ = @import("integration/glfw_vulkan_headers_sanity.zig");
     _ = @import("integration/repo_layout_sanity.zig");
+    _ = @import("integration/viewport_projection_y_parity.zig");
 }
 
 test {

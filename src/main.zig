@@ -19,10 +19,6 @@ const math3d = @import("math3d");
 const Vec3 = math3d.Vec3;
 const Mat4 = math3d.Mat4;
 
-// (kept for future; not used directly since we load from exe dir)
-const vert_spv = @embedFile("generated/shaders/triangle_vert");
-const frag_spv = @embedFile("generated/shaders/triangle_frag");
-
 const Allocator = std.mem.Allocator;
 
 const VK_FALSE32: vk.Bool32 = @enumFromInt(vk.FALSE);
@@ -31,29 +27,25 @@ const VK_TRUE32: vk.Bool32 = @enumFromInt(vk.TRUE);
 const window_title_cstr: [*:0]const u8 = "VRGame — Zigadel Prototype\x00";
 const window_title_base: []const u8 = "VRGame — Zigadel Prototype";
 
-// ── World grid
+// ── World grid (floor plane)
 const GRID_HALF: i32 = 64;
 const GRID_STEP: f32 = 1.0;
 const GRID_SIZE: i32 = GRID_HALF * 2;
 const QUAD_COUNT: usize = @intCast(GRID_SIZE * GRID_SIZE);
 const FLOOR_VERTS: u32 = @intCast(QUAD_COUNT * 6);
 
-const TOTAL_VERTICES: u32 = FLOOR_VERTS;
-const VERTEX_BUFFER_SIZE: vk.DeviceSize =
-    @intCast(@as(usize, TOTAL_VERTICES) * @sizeOf(Vertex));
+// ── Cube (for multi-mesh sanity)
+const CUBE_VERTS: u32 = 36;
 
 // Depth resources
 const DepthResources = struct { image: vk.Image, memory: vk.DeviceMemory, view: vk.ImageView };
 
-// Push-constant block (std430)
-const Push = extern struct { m: [16]f32 };
+// Push-constant block (std430): VP only (model is identity for now)
+const Push = extern struct { vp: [16]f32 };
 
 // ── Y policy (runtime-togglable)
-// Two clearly-defined options:
-//   • viewport: negative viewport height (no projection change)
-//   • projection: positive viewport + negate m[5] in VP
 const YPolicy = enum { viewport, projection };
-var g_y_policy: YPolicy = .viewport; // default works on macOS and (for many drivers) Windows
+var g_y_policy: YPolicy = .viewport; // default; toggle with F6
 
 // ── File helpers
 fn readWholeFile(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -83,7 +75,7 @@ fn updateWindowTitle(window: *glfw.Window, fps: f64, cam: *const Camera3D) void 
     const mode = switch (g_y_policy) { .viewport => "viewport", .projection => "projection" };
     const title = std.fmt.bufPrintZ(
         &buf,
-        "{s} | FPS: {d:.1} | Cam: x={d:.2}, y={d:.2}, z={d:.2} | Y: {s} (F6 to toggle)",
+        "{s} | FPS: {d:.1} | Cam: x={d:.2}, y={d:.2}, z={d:.2} | Y: {s} (F6)",
         .{ window_title_base, fps, cam.position.x, cam.position.y, cam.position.z, mode },
     ) catch return;
     glfw.setWindowTitle(window, title);
@@ -220,7 +212,48 @@ fn writeFloorWorld(verts: [*]Vertex) void {
             idx += 6;
         }
     }
-    std.debug.assert(idx == @as(usize, TOTAL_VERTICES));
+}
+
+// ── Fill unit cube (centered at origin), scaled and translated later via model (future).
+// For now we render with identity model so it sits at origin.
+fn writeCube(verts: [*]Vertex) void {
+    // positions for a unit cube [-0.5, +0.5]
+    const p000 = [3]f32{ -0.5, -0.5, -0.5 };
+    const p001 = [3]f32{ -0.5, -0.5,  0.5 };
+    const p010 = [3]f32{ -0.5,  0.5, -0.5 };
+    const p011 = [3]f32{ -0.5,  0.5,  0.5 };
+    const p100 = [3]f32{  0.5, -0.5, -0.5 };
+    const p101 = [3]f32{  0.5, -0.5,  0.5 };
+    const p110 = [3]f32{  0.5,  0.5, -0.5 };
+    const p111 = [3]f32{  0.5,  0.5,  0.5 };
+
+    // simple face colors
+    const red    = [3]f32{0.86, 0.25, 0.30};
+    const green  = [3]f32{0.30, 0.86, 0.40};
+    const blue   = [3]f32{0.25, 0.45, 0.95};
+    const yellow = [3]f32{0.92, 0.86, 0.25};
+    const cyan   = [3]f32{0.25, 0.86, 0.86};
+    const magenta= [3]f32{0.86, 0.25, 0.86};
+
+    var i: usize = 0;
+    // +X face (right): 100,101,111,110
+    verts[i+0] = .{ .pos = p100, .color = red };    verts[i+1] = .{ .pos = p101, .color = red };    verts[i+2] = .{ .pos = p111, .color = red };
+    verts[i+3] = .{ .pos = p100, .color = red };    verts[i+4] = .{ .pos = p111, .color = red };    verts[i+5] = .{ .pos = p110, .color = red };    i += 6;
+    // -X face (left): 000,010,011,001
+    verts[i+0] = .{ .pos = p000, .color = green };  verts[i+1] = .{ .pos = p010, .color = green };  verts[i+2] = .{ .pos = p011, .color = green };
+    verts[i+3] = .{ .pos = p000, .color = green };  verts[i+4] = .{ .pos = p011, .color = green };  verts[i+5] = .{ .pos = p001, .color = green };  i += 6;
+    // +Y face (top): 010,110,111,011
+    verts[i+0] = .{ .pos = p010, .color = blue };   verts[i+1] = .{ .pos = p110, .color = blue };   verts[i+2] = .{ .pos = p111, .color = blue };
+    verts[i+3] = .{ .pos = p010, .color = blue };   verts[i+4] = .{ .pos = p111, .color = blue };   verts[i+5] = .{ .pos = p011, .color = blue };   i += 6;
+    // -Y face (bottom): 000,001,101,100
+    verts[i+0] = .{ .pos = p000, .color = yellow }; verts[i+1] = .{ .pos = p001, .color = yellow }; verts[i+2] = .{ .pos = p101, .color = yellow };
+    verts[i+3] = .{ .pos = p000, .color = yellow }; verts[i+4] = .{ .pos = p101, .color = yellow }; verts[i+5] = .{ .pos = p100, .color = yellow }; i += 6;
+    // +Z face (front): 001,011,111,101
+    verts[i+0] = .{ .pos = p001, .color = cyan };   verts[i+1] = .{ .pos = p011, .color = cyan };   verts[i+2] = .{ .pos = p111, .color = cyan };
+    verts[i+3] = .{ .pos = p001, .color = cyan };   verts[i+4] = .{ .pos = p111, .color = cyan };   verts[i+5] = .{ .pos = p101, .color = cyan };   i += 6;
+    // -Z face (back): 000,100,110,010
+    verts[i+0] = .{ .pos = p000, .color = magenta }; verts[i+1] = .{ .pos = p100, .color = magenta }; verts[i+2] = .{ .pos = p110, .color = magenta };
+    verts[i+3] = .{ .pos = p000, .color = magenta }; verts[i+4] = .{ .pos = p110, .color = magenta }; verts[i+5] = .{ .pos = p010, .color = magenta }; i += 6;
 }
 
 // ── Buffer copy
@@ -343,9 +376,9 @@ fn createRenderPass(gc: *const GraphicsContext, swapchain: Swapchain, depth_form
 
 fn createPipeline(gc: *const GraphicsContext, layout: vk.PipelineLayout, render_pass: vk.RenderPass) !vk.Pipeline {
     const A = std.heap.c_allocator;
-    const vert_bytes = try loadSpirvFromExeDirAligned(A, "shaders/triangle_vert");
+    const vert_bytes = try loadSpirvFromExeDirAligned(A, "shaders/basic_lit_vert");
     defer A.free(vert_bytes);
-    const frag_bytes = try loadSpirvFromExeDirAligned(A, "shaders/triangle_frag");
+    const frag_bytes = try loadSpirvFromExeDirAligned(A, "shaders/basic_lit_frag");
     defer A.free(frag_bytes);
 
     const vert = try gc.vkd.createShaderModule(gc.dev, &vk.ShaderModuleCreateInfo{
@@ -562,44 +595,85 @@ pub fn main() !void {
     }, null);
     defer gc.vkd.destroyCommandPool(gc.dev, cmd_pool, null);
 
-    // Vertex buffers
-    const vbuf = try gc.vkd.createBuffer(gc.dev, &vk.BufferCreateInfo{
+    // == Vertex buffers (floor + cube) ==
+    const floor_buf_size: vk.DeviceSize = @intCast(@as(usize, FLOOR_VERTS) * @sizeOf(Vertex));
+    const cube_buf_size: vk.DeviceSize = @intCast(@as(usize, CUBE_VERTS) * @sizeOf(Vertex));
+
+    // Device-local buffers
+    const floor_vbuf = try gc.vkd.createBuffer(gc.dev, &vk.BufferCreateInfo{
         .flags = .{},
-        .size = VERTEX_BUFFER_SIZE,
+        .size = floor_buf_size,
         .usage = .{ .transfer_dst_bit = true, .vertex_buffer_bit = true },
         .sharing_mode = .exclusive,
         .queue_family_index_count = 0,
         .p_queue_family_indices = undefined,
     }, null);
-    defer gc.vkd.destroyBuffer(gc.dev, vbuf, null);
+    defer gc.vkd.destroyBuffer(gc.dev, floor_vbuf, null);
 
-    const vreqs = gc.vkd.getBufferMemoryRequirements(gc.dev, vbuf);
-    const vmem = try gc.allocate(vreqs, .{ .device_local_bit = true });
-    defer gc.vkd.freeMemory(gc.dev, vmem, null);
-    try gc.vkd.bindBufferMemory(gc.dev, vbuf, vmem, 0);
-
-    const sbuf = try gc.vkd.createBuffer(gc.dev, &vk.BufferCreateInfo{
+    const cube_vbuf = try gc.vkd.createBuffer(gc.dev, &vk.BufferCreateInfo{
         .flags = .{},
-        .size = VERTEX_BUFFER_SIZE,
+        .size = cube_buf_size,
+        .usage = .{ .transfer_dst_bit = true, .vertex_buffer_bit = true },
+        .sharing_mode = .exclusive,
+        .queue_family_index_count = 0,
+        .p_queue_family_indices = undefined,
+    }, null);
+    defer gc.vkd.destroyBuffer(gc.dev, cube_vbuf, null);
+
+    const floor_vreqs = gc.vkd.getBufferMemoryRequirements(gc.dev, floor_vbuf);
+    const floor_vmem = try gc.allocate(floor_vreqs, .{ .device_local_bit = true });
+    defer gc.vkd.freeMemory(gc.dev, floor_vmem, null);
+    try gc.vkd.bindBufferMemory(gc.dev, floor_vbuf, floor_vmem, 0);
+
+    const cube_vreqs = gc.vkd.getBufferMemoryRequirements(gc.dev, cube_vbuf);
+    const cube_vmem = try gc.allocate(cube_vreqs, .{ .device_local_bit = true });
+    defer gc.vkd.freeMemory(gc.dev, cube_vmem, null);
+    try gc.vkd.bindBufferMemory(gc.dev, cube_vbuf, cube_vmem, 0);
+
+    // Staging buffers
+    const floor_sbuf = try gc.vkd.createBuffer(gc.dev, &vk.BufferCreateInfo{
+        .flags = .{},
+        .size = floor_buf_size,
         .usage = .{ .transfer_src_bit = true },
         .sharing_mode = .exclusive,
         .queue_family_index_count = 0,
         .p_queue_family_indices = undefined,
     }, null);
-    defer gc.vkd.destroyBuffer(gc.dev, sbuf, null);
+    defer gc.vkd.destroyBuffer(gc.dev, floor_sbuf, null);
+    const cube_sbuf = try gc.vkd.createBuffer(gc.dev, &vk.BufferCreateInfo{
+        .flags = .{},
+        .size = cube_buf_size,
+        .usage = .{ .transfer_src_bit = true },
+        .sharing_mode = .exclusive,
+        .queue_family_index_count = 0,
+        .p_queue_family_indices = undefined,
+    }, null);
+    defer gc.vkd.destroyBuffer(gc.dev, cube_sbuf, null);
 
-    const sreqs = gc.vkd.getBufferMemoryRequirements(gc.dev, sbuf);
-    const smem = try gc.allocate(sreqs, .{ .host_visible_bit = true, .host_coherent_bit = true });
-    defer gc.vkd.freeMemory(gc.dev, smem, null);
-    try gc.vkd.bindBufferMemory(gc.dev, sbuf, smem, 0);
+    const floor_sreqs = gc.vkd.getBufferMemoryRequirements(gc.dev, floor_sbuf);
+    const floor_smem = try gc.allocate(floor_sreqs, .{ .host_visible_bit = true, .host_coherent_bit = true });
+    defer gc.vkd.freeMemory(gc.dev, floor_smem, null);
+    try gc.vkd.bindBufferMemory(gc.dev, floor_sbuf, floor_smem, 0);
+
+    const cube_sreqs = gc.vkd.getBufferMemoryRequirements(gc.dev, cube_sbuf);
+    const cube_smem = try gc.allocate(cube_sreqs, .{ .host_visible_bit = true, .host_coherent_bit = true });
+    defer gc.vkd.freeMemory(gc.dev, cube_smem, null);
+    try gc.vkd.bindBufferMemory(gc.dev, cube_sbuf, cube_smem, 0);
 
     // Upload world vertices
     {
-        const ptr = try gc.vkd.mapMemory(gc.dev, smem, 0, vk.WHOLE_SIZE, .{});
-        defer gc.vkd.unmapMemory(gc.dev, smem);
-        const verts: [*]Vertex = @ptrCast(@alignCast(ptr));
-        writeFloorWorld(verts);
-        try copyBuffer(&gc, cmd_pool, vbuf, sbuf, VERTEX_BUFFER_SIZE);
+        var ptr = try gc.vkd.mapMemory(gc.dev, floor_smem, 0, vk.WHOLE_SIZE, .{});
+        const fverts: [*]Vertex = @ptrCast(@alignCast(ptr));
+        writeFloorWorld(fverts);
+        gc.vkd.unmapMemory(gc.dev, floor_smem);
+
+        ptr = try gc.vkd.mapMemory(gc.dev, cube_smem, 0, vk.WHOLE_SIZE, .{});
+        const cverts: [*]Vertex = @ptrCast(@alignCast(ptr));
+        writeCube(cverts);
+        gc.vkd.unmapMemory(gc.dev, cube_smem);
+
+        try copyBuffer(&gc, cmd_pool, floor_vbuf, floor_sbuf, floor_buf_size);
+        try copyBuffer(&gc, cmd_pool, cube_vbuf,  cube_sbuf,  cube_buf_size);
     }
 
     // Camera
@@ -680,18 +754,29 @@ pub fn main() !void {
         gc.vkd.cmdBeginRenderPass(cmdbuf, &rp_begin, vk.SubpassContents.@"inline");
 
         gc.vkd.cmdBindPipeline(cmdbuf, .graphics, pipeline);
-        const offsets = [_]vk.DeviceSize{0};
-        gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @as([*]const vk.Buffer, @ptrCast(&vbuf)), &offsets);
 
-        // Push VP (projection flip only when policy=projection)
+        // Common VP push
         var vp = camera.viewProjMatrix();
         if (g_y_policy == .projection) {
             vp.m[5] = -vp.m[5];
         }
-        const push = Push{ .m = vp.m };
+        const push = Push{ .vp = vp.m };
         gc.vkd.cmdPushConstants(cmdbuf, pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(Push), @ptrCast(&push));
 
-        gc.vkd.cmdDraw(cmdbuf, TOTAL_VERTICES, 1, 0, 0);
+        // Draw floor
+        {
+            const offsets = [_]vk.DeviceSize{0};
+            gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @as([*]const vk.Buffer, @ptrCast(&floor_vbuf)), &offsets);
+            gc.vkd.cmdDraw(cmdbuf, FLOOR_VERTS, 1, 0, 0);
+        }
+
+        // Draw cube (at origin; sized 1x1x1)
+        {
+            const offsets = [_]vk.DeviceSize{0};
+            gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @as([*]const vk.Buffer, @ptrCast(&cube_vbuf)), &offsets);
+            gc.vkd.cmdDraw(cmdbuf, CUBE_VERTS, 1, 0, 0);
+        }
+
         gc.vkd.cmdEndRenderPass(cmdbuf);
         try gc.vkd.endCommandBuffer(cmdbuf);
 
@@ -740,6 +825,6 @@ fn cmdbufsForSwap(gc: *const GraphicsContext, A: Allocator, pool: vk.CommandPool
 }
 
 // ── Inline tests
-test "viewport/pipeline policy toggles are mutually exclusive" {
+test "viewport/projection are distinct policies" {
     try std.testing.expect(@intFromEnum(YPolicy.viewport) != @intFromEnum(YPolicy.projection));
 }

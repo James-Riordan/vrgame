@@ -205,47 +205,78 @@ fn addShaderBuildSteps(
     const shaders_step = b.step("shaders", "Build or stage SPIR-V into zig-out/bin/shaders");
 
     if (glslc_path) |gl| {
-        // vertex
+        // ── triangle shaders ──────────────────────────────────────────────
         var v_cmd = b.addSystemCommand(&.{ gl, "-c", "-fshader-stage=vert", "shaders/triangle.vert" });
         v_cmd.addArg("-o");
         const v_out = v_cmd.addOutputFileArg("triangle_vert");
 
-        // fragment
         var f_cmd = b.addSystemCommand(&.{ gl, "-c", "-fshader-stage=frag", "shaders/triangle.frag" });
         f_cmd.addArg("-o");
         const f_out = f_cmd.addOutputFileArg("triangle_frag");
 
-        // Install beside the exe: zig-out/bin/shaders/*
         const inst_v = b.addInstallFileWithDir(v_out, .bin, "shaders/triangle_vert");
         const inst_f = b.addInstallFileWithDir(f_out, .bin, "shaders/triangle_frag");
+
+        // ── basic_lit shaders ─────────────────────────────────────────────
+        var bl_v = b.addSystemCommand(&.{ gl, "-c", "-fshader-stage=vert", "shaders/basic_lit.vert" });
+        bl_v.addArg("-o");
+        const bl_v_out = bl_v.addOutputFileArg("basic_lit_vert");
+
+        var bl_f = b.addSystemCommand(&.{ gl, "-c", "-fshader-stage=frag", "shaders/basic_lit.frag" });
+        bl_f.addArg("-o");
+        const bl_f_out = bl_f.addOutputFileArg("basic_lit_frag");
+
+        const inst_bl_v = b.addInstallFileWithDir(bl_v_out, .bin, "shaders/basic_lit_vert");
+        const inst_bl_f = b.addInstallFileWithDir(bl_f_out, .bin, "shaders/basic_lit_frag");
 
         shaders_step.dependOn(&v_cmd.step);
         shaders_step.dependOn(&f_cmd.step);
         shaders_step.dependOn(&inst_v.step);
         shaders_step.dependOn(&inst_f.step);
+
+        shaders_step.dependOn(&bl_v.step);
+        shaders_step.dependOn(&bl_f.step);
+        shaders_step.dependOn(&inst_bl_v.step);
+        shaders_step.dependOn(&inst_bl_f.step);
     } else {
         // Fallback to committed blobs if present.
-        const have_vert = blk: {
+        const have_tri_vert = blk: {
             _ = std.fs.cwd().statFile("shaders/triangle_vert") catch break :blk false;
             break :blk true;
         };
-        const have_frag = blk: {
+        const have_tri_frag = blk: {
             _ = std.fs.cwd().statFile("shaders/triangle_frag") catch break :blk false;
             break :blk true;
         };
+        const have_bl_vert = blk: {
+            _ = std.fs.cwd().statFile("shaders/basic_lit_vert") catch break :blk false;
+            break :blk true;
+        };
+        const have_bl_frag = blk: {
+            _ = std.fs.cwd().statFile("shaders/basic_lit_frag") catch break :blk false;
+            break :blk true;
+        };
 
-        if (have_vert and have_frag) {
+        if (have_tri_vert and have_tri_frag) {
             const inst_v = b.addInstallFileWithDir(b.path("shaders/triangle_vert"), .bin, "shaders/triangle_vert");
             const inst_f = b.addInstallFileWithDir(b.path("shaders/triangle_frag"), .bin, "shaders/triangle_frag");
             shaders_step.dependOn(&inst_v.step);
             shaders_step.dependOn(&inst_f.step);
-            std.log.warn("glslc not found; using prebuilt SPIR-V from repo.", .{});
         } else {
             std.log.err(
                 "glslc not found and prebuilt SPIR-V missing; expected {s} and {s}. Install Vulkan SDK (glslc) or add blobs.",
                 .{ "shaders/triangle_vert", "shaders/triangle_frag" },
             );
-            @panic("no SPIR-V available");
+            @panic("no SPIR-V available for triangle");
+        }
+
+        if (have_bl_vert and have_bl_frag) {
+            const inst_bl_v = b.addInstallFileWithDir(b.path("shaders/basic_lit_vert"), .bin, "shaders/basic_lit_vert");
+            const inst_bl_f = b.addInstallFileWithDir(b.path("shaders/basic_lit_frag"), .bin, "shaders/basic_lit_frag");
+            shaders_step.dependOn(&inst_bl_v.step);
+            shaders_step.dependOn(&inst_bl_f.step);
+        } else {
+            std.log.warn("glslc not found; {s} and/or {s} are missing. Only triangle shaders will be staged.", .{ "shaders/basic_lit_vert", "shaders/basic_lit_frag" });
         }
     }
 
@@ -263,6 +294,7 @@ fn addTestRun(b: *std.Build, root_mod: *std.Build.Module) *std.Build.Step.Run {
 // ──────────────────────────────────────────────────────────────────────────────
 // Build graph
 // ──────────────────────────────────────────────────────────────────────────────
+//
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
