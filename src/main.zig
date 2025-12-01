@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const glfw = @import("glfw");
 const vk = @import("vulkan");
 
@@ -17,7 +18,7 @@ const math3d = @import("math3d");
 const Vec3 = math3d.Vec3;
 const Mat4 = math3d.Mat4;
 
-// Optional: present alongside the exe; not directly used in this file.
+// (kept for future; not used directly since we load from exe dir)
 const vert_spv = @embedFile("generated/shaders/triangle_vert");
 const frag_spv = @embedFile("generated/shaders/triangle_frag");
 
@@ -29,9 +30,7 @@ const VK_TRUE32: vk.Bool32 = @enumFromInt(vk.TRUE);
 const window_title_cstr: [*:0]const u8 = "VRGame — Zigadel Prototype\x00";
 const window_title_base: []const u8 = "VRGame — Zigadel Prototype";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// World geo: axis-aligned checkerboard floor in WORLD SPACE
-// ─────────────────────────────────────────────────────────────────────────────
+// ── World grid
 const GRID_HALF: i32 = 64;
 const GRID_STEP: f32 = 1.0;
 const GRID_SIZE: i32 = GRID_HALF * 2;
@@ -49,9 +48,10 @@ const DepthResources = struct {
     view: vk.ImageView,
 };
 
-// Push-constant block (std430 layout, 16*4 bytes)
+// Push-constant block (std430)
 const Push = extern struct { m: [16]f32 };
 
+// Zig 0.16-dev API: readFileAlloc(sub_path, max_bytes, allocator)
 fn readWholeFile(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const limit: std.Io.Limit = @enumFromInt(max_bytes);
     return try std.fs.cwd().readFileAlloc(path, alloc, limit);
@@ -136,9 +136,7 @@ fn sampleCameraInput(window: *glfw.Window) CameraInput {
     return ci;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Depth helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Depth helpers
 fn createDepthResources(gc: *const GraphicsContext, format: vk.Format, extent: vk.Extent2D) !DepthResources {
     const img = try gc.vkd.createImage(gc.dev, &vk.ImageCreateInfo{
         .flags = .{},
@@ -184,9 +182,7 @@ fn destroyDepthResources(gc: *const GraphicsContext, depth: DepthResources) void
     gc.vkd.freeMemory(gc.dev, depth.memory, null);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Geometry: fill WORLD-SPACE floor (once)
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Fill world geometry
 fn writeFloorWorld(verts: [*]Vertex) void {
     var idx: usize = 0;
     const half: i32 = GRID_HALF;
@@ -227,16 +223,14 @@ fn writeFloorWorld(verts: [*]Vertex) void {
     std.debug.assert(idx == @as(usize, TOTAL_VERTICES));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Main
 pub fn main() !void {
     _ = glfw.setErrorCallback(errorCallback);
     try glfw.init();
     defer glfw.terminate();
 
-    // Start with a logical window size; swapchain will pick the real pixel size.
-    var desired_window_extent = vk.Extent2D{ .width = 1280, .height = 800 };
+    // Start with a sensible logical size; GLFW will give us pixel size next.
+    var extent = vk.Extent2D{ .width = 1280, .height = 800 };
 
     glfw.defaultWindowHints();
     glfw.windowHint(glfw.c.GLFW_CLIENT_API, glfw.c.GLFW_NO_API);
@@ -244,35 +238,35 @@ pub fn main() !void {
     if (glfw.getPrimaryMonitor()) |mon| {
         const wa = glfw.getMonitorWorkarea(mon);
         if (wa.width > 0 and wa.height > 0) {
-            desired_window_extent.width = @intCast(@divTrunc(wa.width * 3, 4));
-            desired_window_extent.height = @intCast(@divTrunc(wa.height * 3, 4));
+            extent.width = @intCast(@divTrunc(wa.width * 3, 4));
+            extent.height = @intCast(@divTrunc(wa.height * 3, 4));
         } else if (glfw.getVideoMode(mon)) |vm| {
-            desired_window_extent.width = @intCast(@divTrunc(vm.width * 3, 4));
-            desired_window_extent.height = @intCast(@divTrunc(vm.height * 3, 4));
+            extent.width = @intCast(@divTrunc(vm.width * 3, 4));
+            extent.height = @intCast(@divTrunc(vm.height * 3, 4));
         }
     }
 
     const window = try glfw.createWindow(
-        @as(i32, @intCast(desired_window_extent.width)),
-        @as(i32, @intCast(desired_window_extent.height)),
+        @as(i32, @intCast(extent.width)),
+        @as(i32, @intCast(extent.height)),
         window_title_cstr,
         null,
         null,
     );
     defer glfw.destroyWindow(window);
 
+    // Use framebuffer pixel size (retina-safe) as the true swapchain extent.
+    const fb = glfw.getFramebufferSize(window);
+    // Zig 0.16: use @max (args must be same type)
+    extent.width = @intCast(@max(@as(i32, 1), fb.width));
+    extent.height = @intCast(@max(@as(i32, 1), fb.height));
+
     const allocator = std.heap.c_allocator;
     var gc = try GraphicsContext.init(allocator, window_title_cstr, window);
     defer gc.deinit();
 
-    // Use framebuffer pixels (Retina-aware) for the swapchain extent.
-    var extent = gc.framebufferExtent();
-
     var swapchain = try Swapchain.init(&gc, allocator, extent);
     defer swapchain.deinit();
-
-    // Keep local 'extent' synchronized with the swapchain's real extent.
-    extent = swapchain.extent;
 
     // Pipeline layout with push constants (mat4 VP)
     const push_range = vk.PushConstantRange{
@@ -290,7 +284,7 @@ pub fn main() !void {
     defer gc.vkd.destroyPipelineLayout(gc.dev, pipeline_layout, null);
 
     const depth_format: vk.Format = .d32_sfloat;
-    var depth = try createDepthResources(&gc, depth_format, extent);
+    var depth = try createDepthResources(&gc, depth_format, swapchain.extent);
     defer destroyDepthResources(&gc, depth);
 
     const render_pass = try createRenderPass(&gc, swapchain, depth_format);
@@ -349,7 +343,7 @@ pub fn main() !void {
         .command_buffer_count = @intCast(cmdbufs.len),
     }, cmdbufs.ptr);
 
-    // Write world-space floor once into staging, copy to device-local
+    // Upload world vertices
     {
         const ptr = try gc.vkd.mapMemory(gc.dev, smem, 0, vk.WHOLE_SIZE, .{});
         defer gc.vkd.unmapMemory(gc.dev, smem);
@@ -358,10 +352,13 @@ pub fn main() !void {
         try copyBuffer(&gc, cmd_pool, vbuf, sbuf, VERTEX_BUFFER_SIZE);
     }
 
+    // Camera
+    const fovy: f32 = @floatCast(std.math.degreesToRadians(70.0));
     var camera = Camera3D.init(
         Vec3.init(0.0, 1.7, 4.0),
-        (@as(f32, @floatFromInt(70)) * (@as(f32, @floatCast(std.math.pi)) / 180.0)),
-        @as(f32, @floatFromInt(extent.width)) / @as(f32, @floatFromInt(extent.height)),
+        fovy,
+        @as(f32, @floatFromInt(swapchain.extent.width)) /
+            @as(f32, @floatFromInt(swapchain.extent.height)),
         0.1,
         500.0,
     );
@@ -385,18 +382,34 @@ pub fn main() !void {
         const input = sampleCameraInput(window);
         camera.update(dt, input);
 
-        // Acquire cmdbuf for current image
+        // Record
         const cmdbuf = cmdbufs[swapchain.image_index];
-
-        // Record draw
         try gc.vkd.resetCommandBuffer(cmdbuf, .{});
         try gc.vkd.beginCommandBuffer(cmdbuf, &vk.CommandBufferBeginInfo{
             .flags = .{},
             .p_inheritance_info = null,
         });
 
-        // Viewport/scissor from *actual framebuffer pixels* (fixes Retina)
-        swapchain.cmdSetViewportAndScissor(&gc, cmdbuf);
+        // Always drive viewport/scissor from the swapchain pixel extent.
+        const fb_extent = swapchain.extent;
+
+        var viewport = vk.Viewport{
+            .x = 0,
+            .y = if (builtin.os.tag == .macos)
+                @as(f32, @floatFromInt(fb_extent.height))
+            else
+                0,
+            .width = @as(f32, @floatFromInt(fb_extent.width)),
+            .height = if (builtin.os.tag == .macos)
+                -@as(f32, @floatFromInt(fb_extent.height))
+            else
+                @as(f32, @floatFromInt(fb_extent.height)),
+            .min_depth = 0,
+            .max_depth = 1,
+        };
+        const scissor = vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = fb_extent };
+        gc.vkd.cmdSetViewport(cmdbuf, 0, 1, @as([*]const vk.Viewport, @ptrCast(&viewport)));
+        gc.vkd.cmdSetScissor(cmdbuf, 0, 1, @as([*]const vk.Rect2D, @ptrCast(&scissor)));
 
         const clear_color = vk.ClearValue{ .color = .{ .float_32 = .{ 0.05, 0.05, 0.07, 1.0 } } };
         const clear_depth = vk.ClearValue{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } };
@@ -405,19 +418,17 @@ pub fn main() !void {
         const rp_begin = vk.RenderPassBeginInfo{
             .render_pass = render_pass,
             .framebuffer = framebuffers[swapchain.image_index],
-            // Use the swapchain's real extent, not the logical window size.
-            .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = swapchain.extent },
+            .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = fb_extent },
             .clear_value_count = @intCast(clears.len),
             .p_clear_values = &clears,
         };
         gc.vkd.cmdBeginRenderPass(cmdbuf, &rp_begin, vk.SubpassContents.@"inline");
 
         gc.vkd.cmdBindPipeline(cmdbuf, .graphics, pipeline);
-
         const offsets = [_]vk.DeviceSize{0};
         gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @as([*]const vk.Buffer, @ptrCast(&vbuf)), &offsets);
 
-        // Push VP (aspect already matches pixels)
+        // Push VP (no manual Y-flip; mac fix is via negative viewport height)
         const push = Push{ .m = camera.viewProjMatrix().m };
         gc.vkd.cmdPushConstants(cmdbuf, pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(Push), @ptrCast(&push));
 
@@ -425,24 +436,26 @@ pub fn main() !void {
         gc.vkd.cmdEndRenderPass(cmdbuf);
         try gc.vkd.endCommandBuffer(cmdbuf);
 
-        // Present
         const state = swapchain.present(cmdbuf) catch |err| switch (err) {
             error.OutOfDateKHR => Swapchain.PresentState.suboptimal,
             else => |narrow| return narrow,
         };
 
-        // Handle resize either via suboptimal present or explicit GLFW callback flag.
-        if (state == .suboptimal or gc.takeResizeFlag()) {
-            // Get the current framebuffer size in pixels.
-            const fb = gc.framebufferExtent();
-            if (fb.width == 0 or fb.height == 0) {
-                glfw.pollEvents();
-                continue;
-            }
+        // Decide at runtime, but guard the optional method at comptime
+        var need_recreate = (state == .suboptimal);
+        const has_take = @hasDecl(GraphicsContext, "takeResizeFlag");
+        if (has_take) {
+            // Only call if it exists
+            need_recreate = need_recreate or gc.takeResizeFlag();
+        }
 
-            // Recreate swapchain & size-dependent resources.
-            try swapchain.recreate(fb);
-            extent = swapchain.extent;
+        if (need_recreate) {
+            // Rebuild using true framebuffer pixel size (retina-safe)
+            const fb2 = glfw.getFramebufferSize(window);
+            extent.width = @intCast(@max(@as(i32, 1), fb2.width));
+            extent.height = @intCast(@max(@as(i32, 1), fb2.height));
+
+            try swapchain.recreate(extent);
 
             const new_aspect: f32 =
                 @as(f32, @floatFromInt(extent.width)) / @as(f32, @floatFromInt(extent.height));
@@ -450,7 +463,7 @@ pub fn main() !void {
 
             destroyFramebuffers(&gc, allocator, framebuffers);
             destroyDepthResources(&gc, depth);
-            depth = try createDepthResources(&gc, depth_format, extent);
+            depth = try createDepthResources(&gc, depth_format, swapchain.extent);
             framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth.view);
         }
 
@@ -460,9 +473,7 @@ pub fn main() !void {
     try swapchain.waitForAllFences();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Buffer copy
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Buffer copy
 fn copyBuffer(
     gc: *const GraphicsContext,
     pool: vk.CommandPool,
@@ -502,7 +513,7 @@ fn copyBuffer(
     try gc.vkd.queueWaitIdle(gc.graphics_queue.handle);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Framebuffers / Render pass / Pipeline
 fn createFramebuffers(
     gc: *const GraphicsContext,
     allocator: Allocator,
@@ -653,7 +664,7 @@ fn createPipeline(
         .depth_clamp_enable = VK_FALSE32,
         .rasterizer_discard_enable = VK_FALSE32,
         .polygon_mode = .fill,
-        .cull_mode = .{}, // no culling for demo
+        .cull_mode = .{}, // no culling
         .front_face = .clockwise,
         .depth_bias_enable = VK_FALSE32,
         .depth_bias_constant_factor = 0,
@@ -679,8 +690,24 @@ fn createPipeline(
         .depth_compare_op = .less,
         .depth_bounds_test_enable = VK_FALSE32,
         .stencil_test_enable = VK_FALSE32,
-        .front = .{ .fail_op = .keep, .pass_op = .keep, .depth_fail_op = .keep, .compare_op = .always, .compare_mask = 0, .write_mask = 0, .reference = 0 },
-        .back = .{ .fail_op = .keep, .pass_op = .keep, .depth_fail_op = .keep, .compare_op = .always, .compare_mask = 0, .write_mask = 0, .reference = 0 },
+        .front = .{
+            .fail_op = .keep,
+            .pass_op = .keep,
+            .depth_fail_op = .keep,
+            .compare_op = .always,
+            .compare_mask = 0,
+            .write_mask = 0,
+            .reference = 0,
+        },
+        .back = .{
+            .fail_op = .keep,
+            .pass_op = .keep,
+            .depth_fail_op = .keep,
+            .compare_op = .always,
+            .compare_mask = 0,
+            .write_mask = 0,
+            .reference = 0,
+        },
         .min_depth_bounds = 0.0,
         .max_depth_bounds = 1.0,
     };
