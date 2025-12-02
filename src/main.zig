@@ -20,6 +20,8 @@ const Mat4 = math3d.Mat4;
 
 const Allocator = std.mem.Allocator;
 
+const IS_MAC = builtin.os.tag == .macos;
+
 const VK_FALSE32: vk.Bool32 = @enumFromInt(vk.FALSE);
 const VK_TRUE32: vk.Bool32 = @enumFromInt(vk.TRUE);
 
@@ -936,21 +938,38 @@ pub fn main() !void {
         const KeyLatch = struct {
             var f11_was_down: bool = false;
             var altenter_was_down: bool = false;
+            var cmdctrlf_was_down: bool = false; // mac-only combo
         };
 
-        { // --- fullscreen toggles ---
-            // F11
-            const f11 = glfw.getKey(window, glfw.c.GLFW_KEY_F11) == glfw.c.GLFW_PRESS;
-            if (f11 and !KeyLatch.f11_was_down) toggleFullscreen(window);
-            KeyLatch.f11_was_down = f11;
+        { // --- fullscreen toggles (cross-platform) ---
+            var should_toggle = false;
 
-            // Alt+Enter (treat as single edge)
+            // Alt+Enter (universal)
             const alt = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_ALT) == glfw.c.GLFW_PRESS) or
                 (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_ALT) == glfw.c.GLFW_PRESS);
             const enter = glfw.getKey(window, glfw.c.GLFW_KEY_ENTER) == glfw.c.GLFW_PRESS;
             const altenter = alt and enter;
-            if (altenter and !KeyLatch.altenter_was_down) toggleFullscreen(window);
+            if (altenter and !KeyLatch.altenter_was_down) should_toggle = true;
             KeyLatch.altenter_was_down = altenter;
+
+            // F11 (Windows/Linux; skip on mac because OS often steals it)
+            const f11 = glfw.getKey(window, glfw.c.GLFW_KEY_F11) == glfw.c.GLFW_PRESS;
+            if (!IS_MAC and f11 and !KeyLatch.f11_was_down) should_toggle = true;
+            KeyLatch.f11_was_down = f11;
+
+            // macOS: Cmd+Ctrl+F (matches native convention)
+            if (IS_MAC) {
+                const cmd = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_SUPER) == glfw.c.GLFW_PRESS) or
+                    (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_SUPER) == glfw.c.GLFW_PRESS);
+                const ctrl = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_CONTROL) == glfw.c.GLFW_PRESS) or
+                    (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_CONTROL) == glfw.c.GLFW_PRESS);
+                const f = glfw.getKey(window, glfw.c.GLFW_KEY_F) == glfw.c.GLFW_PRESS;
+                const cmdctrlf = cmd and ctrl and f;
+                if (cmdctrlf and !KeyLatch.cmdctrlf_was_down) should_toggle = true;
+                KeyLatch.cmdctrlf_was_down = cmdctrlf;
+            }
+
+            if (should_toggle) toggleFullscreen(window);
         }
 
         const esc = glfw.getKey(window, glfw.c.GLFW_KEY_ESCAPE);
