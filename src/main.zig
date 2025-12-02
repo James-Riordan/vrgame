@@ -57,6 +57,16 @@ const InputState = struct {
     var raw_mouse_checked: bool = false; // only try enabling raw mouse once
 };
 
+const WindowState = struct {
+    var fullscreen: bool = false;
+
+    // Saved windowed-mode rect so we can restore after fullscreen
+    var saved_x: i32 = 100;
+    var saved_y: i32 = 100;
+    var saved_w: i32 = 1280;
+    var saved_h: i32 = 800;
+};
+
 // ── Clock helpers
 fn nowMsFromGlfw() i64 {
     return @as(i64, @intFromFloat(glfw.getTime() * 1000.0));
@@ -84,6 +94,44 @@ fn waitForNonZeroFramebuffer(window: *glfw.Window) void {
         if (fb.width > 0 and fb.height > 0) break;
         glfw.pollEvents();
         if (nowMsFromGlfw() >= deadline) break;
+    }
+}
+
+fn toggleFullscreen(window: *glfw.Window) void {
+    if (!WindowState.fullscreen) {
+        // capture current windowed rect
+        const pos = glfw.getWindowPos(window);
+        const sz = glfw.getWindowSize(window);
+        WindowState.saved_x = pos.x;
+        WindowState.saved_y = pos.y;
+        WindowState.saved_w = sz.width;
+        WindowState.saved_h = sz.height;
+
+        const mon = glfw.getPrimaryMonitor() orelse return;
+        const mode = glfw.getVideoMode(mon) orelse return;
+        // go borderless fullscreen at native mode
+        glfw.setWindowMonitor(
+            window,
+            mon,
+            0,
+            0,
+            mode.width,
+            mode.height,
+            mode.refresh_rate,
+        );
+        WindowState.fullscreen = true;
+    } else {
+        // restore windowed
+        glfw.setWindowMonitor(
+            window,
+            null,
+            WindowState.saved_x,
+            WindowState.saved_y,
+            WindowState.saved_w,
+            WindowState.saved_h,
+            0,
+        );
+        WindowState.fullscreen = false;
     }
 }
 
@@ -688,6 +736,15 @@ pub fn main() !void {
     );
     defer glfw.destroyWindow(window);
 
+    {
+        const pos = glfw.getWindowPos(window);
+        const sz = glfw.getWindowSize(window);
+        WindowState.saved_x = pos.x;
+        WindowState.saved_y = pos.y;
+        WindowState.saved_w = sz.width;
+        WindowState.saved_h = sz.height;
+    }
+
     // Ensure initial framebuffer is not zero.
     waitForNonZeroFramebuffer(window);
 
@@ -874,6 +931,26 @@ pub fn main() !void {
                 .{ window_title_base, tick.fps, camera.position.x, camera.position.y, camera.position.z },
             ) catch null;
             if (title) |z| glfw.setWindowTitle(window, z);
+        }
+
+        const KeyLatch = struct {
+            var f11_was_down: bool = false;
+            var altenter_was_down: bool = false;
+        };
+
+        { // --- fullscreen toggles ---
+            // F11
+            const f11 = glfw.getKey(window, glfw.c.GLFW_KEY_F11) == glfw.c.GLFW_PRESS;
+            if (f11 and !KeyLatch.f11_was_down) toggleFullscreen(window);
+            KeyLatch.f11_was_down = f11;
+
+            // Alt+Enter (treat as single edge)
+            const alt = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_ALT) == glfw.c.GLFW_PRESS) or
+                (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_ALT) == glfw.c.GLFW_PRESS);
+            const enter = glfw.getKey(window, glfw.c.GLFW_KEY_ENTER) == glfw.c.GLFW_PRESS;
+            const altenter = alt and enter;
+            if (altenter and !KeyLatch.altenter_was_down) toggleFullscreen(window);
+            KeyLatch.altenter_was_down = altenter;
         }
 
         const esc = glfw.getKey(window, glfw.c.GLFW_KEY_ESCAPE);
