@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const glfw = @import("glfw");
 const vk = @import("vulkan");
+const depth = @import("graphics/depth.zig");
 
 const GraphicsContext = @import("graphics_context").GraphicsContext;
 const Swapchain = @import("swapchain").Swapchain;
@@ -53,7 +54,6 @@ const VIEWPORT_Y_FLIP: bool = true;
 const PROJECTION_Y_FLIP: bool = false;
 
 // ── Declarative config (overridden by config.json if present)
-//     Flattened to match use-sites in this file.
 const Config = struct {
     fov_deg: f32 = 70.0,
     mouse_sens: f32 = 0.12,
@@ -96,6 +96,11 @@ const WindowState = struct {
     var saved_y: i32 = 100;
     var saved_w: i32 = 1280;
     var saved_h: i32 = 800;
+};
+
+// Hot-reload latch
+const HotReload = struct {
+    var f5_down: bool = false;
 };
 
 // ── Clock helpers
@@ -294,10 +299,10 @@ fn createDepthResources(gc: *const GraphicsContext, format: vk.Format, extent: v
     return .{ .image = img, .memory = mem, .view = view };
 }
 
-fn destroyDepthResources(gc: *const GraphicsContext, depth: DepthResources) void {
-    gc.vkd.destroyImageView(gc.dev, depth.view, null);
-    gc.vkd.destroyImage(gc.dev, depth.image, null);
-    gc.vkd.freeMemory(gc.dev, depth.memory, null);
+fn destroyDepthResources(gc: *const GraphicsContext, depth_res: DepthResources) void {
+    gc.vkd.destroyImageView(gc.dev, depth_res.view, null);
+    gc.vkd.destroyImage(gc.dev, depth_res.image, null);
+    gc.vkd.freeMemory(gc.dev, depth_res.memory, null);
 }
 
 // ── Buffer copy
@@ -474,13 +479,18 @@ fn loadFirstSpirv(alloc: Allocator, title: []const u8, candidates: []const []con
 fn createPipeline(gc: *const GraphicsContext, layout: vk.PipelineLayout, render_pass: vk.RenderPass) !vk.Pipeline {
     const A = std.heap.c_allocator;
 
+    // Prefer names produced by build.zig (no extension), then tolerate .spv variants.
     const vert_candidates = [_][]const u8{
+        "shaders/basic_lit_vert",
+        "shaders/triangle_vert",
         "shaders/basic_lit.vert.spv",
         "shaders/basic_lit_vert.spv",
         "shaders/triangle.vert.spv",
         "shaders/triangle_vert.spv",
     };
     const frag_candidates = [_][]const u8{
+        "shaders/basic_lit_frag",
+        "shaders/triangle_frag",
         "shaders/basic_lit.frag.spv",
         "shaders/basic_lit_frag.spv",
         "shaders/triangle.frag.spv",
@@ -967,17 +977,27 @@ pub fn main() !void {
     }, null);
     defer gc.vkd.destroyPipelineLayout(gc.dev, pipeline_layout, null);
 
-    const depth_format: vk.Format = .d32_sfloat;
-    var depth = try createDepthResources(&gc, depth_format, swapchain.extent);
-    defer destroyDepthResources(&gc, depth);
+    // Pick a supported depth format and create depth resources via your module
+    const depth_format: vk.Format = try depth.chooseDepthFormat(gc.vki, gc.pdev);
+
+    const mem_props = gc.vki.getPhysicalDeviceMemoryProperties(gc.pdev);
+
+    var depth_res = try depth.createDepthResources(gc.vkd, gc.dev, .{
+        .extent = swapchain.extent,
+        .memory_props = mem_props,
+        .format = depth_format,
+        .sample_count = .{ .@"1_bit" = true },
+        .allocator = null,
+    });
+    defer depth_res.destroy(gc.vkd, gc.dev, null);
 
     const render_pass = try createRenderPass(&gc, swapchain, depth_format);
     defer gc.vkd.destroyRenderPass(gc.dev, render_pass, null);
 
-    const pipeline = try createPipeline(&gc, pipeline_layout, render_pass);
+    var pipeline = try createPipeline(&gc, pipeline_layout, render_pass);
     defer gc.vkd.destroyPipeline(gc.dev, pipeline, null);
 
-    var framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth.view);
+    var framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth_res.view);
     defer destroyFramebuffers(&gc, allocator, framebuffers);
 
     // Command pool
@@ -1143,6 +1163,19 @@ pub fn main() !void {
             LockState.locked = false;
         }
 
+        // --- Hot-reload shaders (F5) ---
+        // Re-run `zig build shaders` in another terminal to stage new blobs, then press F5 here.
+        {
+            const f5_now = glfw.getKey(window, glfw.c.GLFW_KEY_F5) == glfw.c.GLFW_PRESS;
+            if (f5_now and !HotReload.f5_down) {
+                gc.vkd.deviceWaitIdle(gc.dev) catch {};
+                gc.vkd.destroyPipeline(gc.dev, pipeline, null);
+                pipeline = try createPipeline(&gc, pipeline_layout, render_pass);
+                std.log.info("Shaders hot-reloaded (new pipeline created).", .{});
+            }
+            HotReload.f5_down = f5_now;
+        }
+
         const input = sampleCameraInput(window, rmb_down);
         camera.update(dt, input);
 
@@ -1245,9 +1278,16 @@ pub fn main() !void {
                 if (comptime @hasField(@TypeOf(camera), "aspect")) camera.aspect = new_aspect;
 
                 destroyFramebuffers(&gc, allocator, framebuffers);
-                destroyDepthResources(&gc, depth);
-                depth = try createDepthResources(&gc, depth_format, swapchain.extent);
-                framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth.view);
+                depth_res.destroy(gc.vkd, gc.dev, null);
+                depth_res = try depth.createDepthResources(gc.vkd, gc.dev, .{
+                    .extent = swapchain.extent,
+                    .memory_props = mem_props, // reuse from earlier
+                    .format = depth_format,
+                    .sample_count = .{ .@"1_bit" = true },
+                    .allocator = null,
+                });
+
+                framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth_res.view);
 
                 // Recreate command buffers to match new image count
                 freeCmdBuffers(&gc, allocator, cmd_pool, cmdbufs);
