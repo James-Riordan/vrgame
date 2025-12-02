@@ -206,28 +206,28 @@ fn addShaderBuildSteps(
 
     if (glslc_path) |gl| {
         // ── triangle shaders ──────────────────────────────────────────────
-        var v_cmd = b.addSystemCommand(&.{ gl, "-c", "-fshader-stage=vert", "shaders/triangle.vert" });
+        var v_cmd = b.addSystemCommand(&.{ gl, "-O", "-c", "-fshader-stage=vert", "shaders/triangle.vert" });
         v_cmd.addArg("-o");
-        const v_out = v_cmd.addOutputFileArg("triangle_vert");
+        const v_out = v_cmd.addOutputFileArg("triangle.vert.spv");
 
-        var f_cmd = b.addSystemCommand(&.{ gl, "-c", "-fshader-stage=frag", "shaders/triangle.frag" });
+        var f_cmd = b.addSystemCommand(&.{ gl, "-O", "-c", "-fshader-stage=frag", "shaders/triangle.frag" });
         f_cmd.addArg("-o");
-        const f_out = f_cmd.addOutputFileArg("triangle_frag");
+        const f_out = f_cmd.addOutputFileArg("triangle.frag.spv");
 
-        const inst_v = b.addInstallFileWithDir(v_out, .bin, "shaders/triangle_vert");
-        const inst_f = b.addInstallFileWithDir(f_out, .bin, "shaders/triangle_frag");
+        const inst_v = b.addInstallFileWithDir(v_out, .bin, "shaders/triangle.vert.spv");
+        const inst_f = b.addInstallFileWithDir(f_out, .bin, "shaders/triangle.frag.spv");
 
         // ── basic_lit shaders ─────────────────────────────────────────────
-        var bl_v = b.addSystemCommand(&.{ gl, "-c", "-fshader-stage=vert", "shaders/basic_lit.vert" });
+        var bl_v = b.addSystemCommand(&.{ gl, "-O", "-c", "-fshader-stage=vert", "shaders/basic_lit.vert" });
         bl_v.addArg("-o");
-        const bl_v_out = bl_v.addOutputFileArg("basic_lit_vert");
+        const bl_v_out = bl_v.addOutputFileArg("basic_lit.vert.spv");
 
-        var bl_f = b.addSystemCommand(&.{ gl, "-c", "-fshader-stage=frag", "shaders/basic_lit.frag" });
+        var bl_f = b.addSystemCommand(&.{ gl, "-O", "-c", "-fshader-stage=frag", "shaders/basic_lit.frag" });
         bl_f.addArg("-o");
-        const bl_f_out = bl_f.addOutputFileArg("basic_lit_frag");
+        const bl_f_out = bl_f.addOutputFileArg("basic_lit.frag.spv");
 
-        const inst_bl_v = b.addInstallFileWithDir(bl_v_out, .bin, "shaders/basic_lit_vert");
-        const inst_bl_f = b.addInstallFileWithDir(bl_f_out, .bin, "shaders/basic_lit_frag");
+        const inst_bl_v = b.addInstallFileWithDir(bl_v_out, .bin, "shaders/basic_lit.vert.spv");
+        const inst_bl_f = b.addInstallFileWithDir(bl_f_out, .bin, "shaders/basic_lit.frag.spv");
 
         shaders_step.dependOn(&v_cmd.step);
         shaders_step.dependOn(&f_cmd.step);
@@ -239,44 +239,44 @@ fn addShaderBuildSteps(
         shaders_step.dependOn(&inst_bl_v.step);
         shaders_step.dependOn(&inst_bl_f.step);
     } else {
-        // Fallback to committed blobs if present.
-        const have_tri_vert = blk: {
-            _ = std.fs.cwd().statFile("shaders/triangle_vert") catch break :blk false;
-            break :blk true;
-        };
-        const have_tri_frag = blk: {
-            _ = std.fs.cwd().statFile("shaders/triangle_frag") catch break :blk false;
-            break :blk true;
-        };
-        const have_bl_vert = blk: {
-            _ = std.fs.cwd().statFile("shaders/basic_lit_vert") catch break :blk false;
-            break :blk true;
-        };
-        const have_bl_frag = blk: {
-            _ = std.fs.cwd().statFile("shaders/basic_lit_frag") catch break :blk false;
-            break :blk true;
-        };
+        // Fallback to committed blobs if present (support new and legacy names).
+        const have_tri_vert_spv = std.fs.cwd().statFile("shaders/triangle.vert.spv") catch null != null;
+        const have_tri_frag_spv = std.fs.cwd().statFile("shaders/triangle.frag.spv") catch null != null;
+        const have_tri_vert_old = std.fs.cwd().statFile("shaders/triangle_vert") catch null != null;
+        const have_tri_frag_old = std.fs.cwd().statFile("shaders/triangle_frag") catch null != null;
 
-        if (have_tri_vert and have_tri_frag) {
-            const inst_v = b.addInstallFileWithDir(b.path("shaders/triangle_vert"), .bin, "shaders/triangle_vert");
-            const inst_f = b.addInstallFileWithDir(b.path("shaders/triangle_frag"), .bin, "shaders/triangle_frag");
+        const have_bl_vert_spv = std.fs.cwd().statFile("shaders/basic_lit.vert.spv") catch null != null;
+        const have_bl_frag_spv = std.fs.cwd().statFile("shaders/basic_lit.frag.spv") catch null != null;
+        const have_bl_vert_old = std.fs.cwd().statFile("shaders/basic_lit_vert") catch null != null;
+        const have_bl_frag_old = std.fs.cwd().statFile("shaders/basic_lit_frag") catch null != null;
+
+        if ((have_tri_vert_spv and have_tri_frag_spv) or (have_tri_vert_old and have_tri_frag_old)) {
+            const tri_v_src = if (have_tri_vert_spv) b.path("shaders/triangle.vert.spv") else b.path("shaders/triangle_vert");
+            const tri_f_src = if (have_tri_frag_spv) b.path("shaders/triangle.frag.spv") else b.path("shaders/triangle_frag");
+            const inst_v = b.addInstallFileWithDir(tri_v_src, .bin, "shaders/triangle.vert.spv");
+            const inst_f = b.addInstallFileWithDir(tri_f_src, .bin, "shaders/triangle.frag.spv");
             shaders_step.dependOn(&inst_v.step);
             shaders_step.dependOn(&inst_f.step);
         } else {
             std.log.err(
-                "glslc not found and prebuilt SPIR-V missing; expected {s} and {s}. Install Vulkan SDK (glslc) or add blobs.",
-                .{ "shaders/triangle_vert", "shaders/triangle_frag" },
+                "glslc not found and prebuilt SPIR-V missing; expected {s}/{s} or legacy {s}/{s}. Install Vulkan SDK (glslc) or add blobs.",
+                .{ "shaders/triangle.vert.spv", "shaders/triangle.frag.spv", "shaders/triangle_vert", "shaders/triangle_frag" },
             );
             @panic("no SPIR-V available for triangle");
         }
 
-        if (have_bl_vert and have_bl_frag) {
-            const inst_bl_v = b.addInstallFileWithDir(b.path("shaders/basic_lit_vert"), .bin, "shaders/basic_lit_vert");
-            const inst_bl_f = b.addInstallFileWithDir(b.path("shaders/basic_lit_frag"), .bin, "shaders/basic_lit_frag");
+        if ((have_bl_vert_spv and have_bl_frag_spv) or (have_bl_vert_old and have_bl_frag_old)) {
+            const bl_v_src = if (have_bl_vert_spv) b.path("shaders/basic_lit.vert.spv") else b.path("shaders/basic_lit_vert");
+            const bl_f_src = if (have_bl_frag_spv) b.path("shaders/basic_lit.frag.spv") else b.path("shaders/basic_lit_frag");
+            const inst_bl_v = b.addInstallFileWithDir(bl_v_src, .bin, "shaders/basic_lit.vert.spv");
+            const inst_bl_f = b.addInstallFileWithDir(bl_f_src, .bin, "shaders/basic_lit.frag.spv");
             shaders_step.dependOn(&inst_bl_v.step);
             shaders_step.dependOn(&inst_bl_f.step);
         } else {
-            std.log.warn("glslc not found; {s} and/or {s} are missing. Only triangle shaders will be staged.", .{ "shaders/basic_lit_vert", "shaders/basic_lit_frag" });
+            std.log.warn(
+                "glslc not found; {s}/{s} (or legacy {s}/{s}) are missing. Only triangle shaders will be staged.",
+                .{ "shaders/basic_lit.vert.spv", "shaders/basic_lit.frag.spv", "shaders/basic_lit_vert", "shaders/basic_lit_frag" },
+            );
         }
     }
 
@@ -415,7 +415,7 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
-    // Make sure OpenXR codegen happens before anything that imports xr_mod.
+    // OpenXR codegen before anything that imports xr_mod.
     exe.step.dependOn(&xr_gen_cmd.step);
 
     // GLFW + Vulkan loader
@@ -453,7 +453,6 @@ pub fn build(b: *std.Build) void {
     const run_math3d_tests = addTestRun(b, math3d_mod);
     const run_camera3d_tests = addTestRun(b, camera3d_mod);
 
-    // Any unit test can transitively pull XR; make them all depend on codegen.
     inline for ([_]*std.Build.Step.Run{
         run_main_tests,
         run_graphics_context_tests,
@@ -466,7 +465,6 @@ pub fn build(b: *std.Build) void {
         run_camera3d_tests,
     }) |r| {
         r.step.dependOn(&xr_gen_cmd.step);
-        // If any unit test embeds SPIR-V later, this keeps them safe:
         r.step.dependOn(shaders_step);
     }
 
@@ -480,7 +478,7 @@ pub fn build(b: *std.Build) void {
     unit_step.dependOn(&run_math3d_tests.step);
     unit_step.dependOn(&run_camera3d_tests.step);
 
-    // Integration tests (wired with imports; no relative @import)
+    // Integration tests
     const have_integration = blk: {
         _ = std.fs.cwd().statFile("tests/test_all_integration.zig") catch break :blk false;
         break :blk true;
@@ -504,7 +502,6 @@ pub fn build(b: *std.Build) void {
         integration_mod.addImport("camera3d", camera3d_mod);
 
         const integration_tests = b.addTest(.{ .root_module = integration_mod });
-        // XR codegen + shaders must precede integration tests.
         integration_tests.step.dependOn(&xr_gen_cmd.step);
         integration_tests.step.dependOn(shaders_step);
 

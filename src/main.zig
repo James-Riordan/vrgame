@@ -477,22 +477,14 @@ fn createPipeline(gc: *const GraphicsContext, layout: vk.PipelineLayout, render_
     const vert_candidates = [_][]const u8{
         "shaders/basic_lit.vert.spv",
         "shaders/basic_lit_vert.spv",
-        "shaders/basic_lit.vert",
-        "shaders/basic_lit_vert",
         "shaders/triangle.vert.spv",
         "shaders/triangle_vert.spv",
-        "shaders/triangle.vert",
-        "shaders/triangle_vert",
     };
     const frag_candidates = [_][]const u8{
         "shaders/basic_lit.frag.spv",
         "shaders/basic_lit_frag.spv",
-        "shaders/basic_lit.frag",
-        "shaders/basic_lit_frag",
         "shaders/triangle.frag.spv",
         "shaders/triangle_frag.spv",
-        "shaders/triangle.frag",
-        "shaders/triangle_frag",
     };
 
     const vert_bytes = try loadFirstSpirv(A, "VERT", &vert_candidates);
