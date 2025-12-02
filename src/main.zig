@@ -46,14 +46,15 @@ const Push = extern struct { model: [16]f32 };
 // Camera UBO
 const CameraUBO = extern struct { vp: [16]f32 };
 
-// ── Y-flip policy: always flip via negative viewport height (portable & correct)
+// ── Flip policy: always flip via negative viewport height (portable & correct)
 const VIEWPORT_Y_FLIP: bool = true;
 const PROJECTION_Y_FLIP: bool = false;
 
+// Input subsystem state (persists across frames)
 const InputState = struct {
     var just_locked: bool = false; // set when we first lock cursor this frame
-    var raw_mouse_enabled: bool = false;
-    var raw_mouse_checked: bool = false;
+    var raw_mouse_enabled: bool = false; // true if raw mouse turned on
+    var raw_mouse_checked: bool = false; // only try enabling raw mouse once
 };
 
 // ── Clock helpers
@@ -636,20 +637,25 @@ fn writeUnitCube(verts: []Vertex) void {
     std.debug.assert(i == @as(usize, CUBE_VERTS));
 }
 
-// Allocate per-swapchain command buffers once (idempotent helper).
-fn cmdbufsForSwap(gc: *const GraphicsContext, A: Allocator, pool: vk.CommandPool, count: usize) []vk.CommandBuffer {
-    const State = struct {
-        var bufs: ?[]vk.CommandBuffer = null;
-    };
-    if (State.bufs) |b| return b;
-    var bufs = A.alloc(vk.CommandBuffer, count) catch @panic("oom");
-    gc.vkd.allocateCommandBuffers(gc.dev, &vk.CommandBufferAllocateInfo{
+// ── Command buffers helpers
+fn allocateCmdBuffers(gc: *const GraphicsContext, A: Allocator, pool: vk.CommandPool, count: usize) ![]vk.CommandBuffer {
+    var bufs = try A.alloc(vk.CommandBuffer, count);
+    errdefer A.free(bufs);
+
+    try gc.vkd.allocateCommandBuffers(gc.dev, &vk.CommandBufferAllocateInfo{
         .command_pool = pool,
         .level = .primary,
         .command_buffer_count = @intCast(count),
-    }, bufs.ptr) catch @panic("alloc cmdbufs");
-    State.bufs = bufs;
+    }, bufs.ptr);
+
     return bufs;
+}
+
+fn freeCmdBuffers(gc: *const GraphicsContext, A: Allocator, pool: vk.CommandPool, bufs: []vk.CommandBuffer) void {
+    if (bufs.len != 0) {
+        gc.vkd.freeCommandBuffers(gc.dev, pool, @intCast(bufs.len), bufs.ptr);
+        A.free(bufs);
+    }
 }
 
 // ── Main
@@ -848,8 +854,14 @@ pub fn main() !void {
     };
     gc.vkd.updateDescriptorSets(gc.dev, 1, @ptrCast(&write), 0, undefined);
 
-    // Lazy-allocated command buffers (cached)
-    const cmdbufs = cmdbufsForSwap(&gc, allocator, cmd_pool, framebuffers.len);
+    // Command buffers (own + reallocate on resize)
+    var cmdbufs = try allocateCmdBuffers(&gc, allocator, cmd_pool, framebuffers.len);
+    defer freeCmdBuffers(&gc, allocator, cmd_pool, cmdbufs);
+
+    // RMB lock state (persists)
+    const LockState = struct {
+        var locked: bool = false;
+    };
 
     while (!glfw.windowShouldClose(window)) {
         const tick = frame_timer.tick(nowMsFromGlfw());
@@ -876,10 +888,6 @@ pub fn main() !void {
         // --- FPS mouse lock & raw mouse motion ---
         const rmb_state = glfw.getMouseButton(window, glfw.c.GLFW_MOUSE_BUTTON_RIGHT);
         const want_lock = (rmb_state == glfw.c.GLFW_PRESS);
-
-        const LockState = struct {
-            var locked: bool = false;
-        };
 
         if (want_lock and !LockState.locked) {
             // Enter lock: hide & confine cursor for proper FPS look
@@ -999,6 +1007,10 @@ pub fn main() !void {
                 destroyDepthResources(&gc, depth);
                 depth = try createDepthResources(&gc, depth_format, swapchain.extent);
                 framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth.view);
+
+                // Recreate command buffers to match new image count
+                freeCmdBuffers(&gc, allocator, cmd_pool, cmdbufs);
+                cmdbufs = try allocateCmdBuffers(&gc, allocator, cmd_pool, framebuffers.len);
             }
         }
 
