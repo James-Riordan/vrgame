@@ -52,6 +52,35 @@ const CameraUBO = extern struct { vp: [16]f32 };
 const VIEWPORT_Y_FLIP: bool = true;
 const PROJECTION_Y_FLIP: bool = false;
 
+// ── Declarative config (overridden by config.json if present)
+//     Flattened to match use-sites in this file.
+const Config = struct {
+    fov_deg: f32 = 70.0,
+    mouse_sens: f32 = 0.12,
+    invert_y: bool = false,
+    enable_raw_mouse: bool = true,
+    base_move_speed_scale: f32 = 1.0,
+    sprint_mult: f32 = 2.5,
+    allow_alt_enter: bool = true,
+    allow_f11: bool = true,
+    allow_cmd_ctrl_f_mac: bool = true,
+};
+
+// JSON overlay type (all fields optional)
+const ConfigFile = struct {
+    fov_deg: ?f32 = null,
+    mouse_sens: ?f32 = null,
+    invert_y: ?bool = null,
+    enable_raw_mouse: ?bool = null,
+    base_move_speed_scale: ?f32 = null,
+    sprint_mult: ?f32 = null,
+    allow_alt_enter: ?bool = null,
+    allow_f11: ?bool = null,
+    allow_cmd_ctrl_f_mac: ?bool = null,
+};
+
+var CONFIG: Config = .{};
+
 // Input subsystem state (persists across frames)
 const InputState = struct {
     var just_locked: bool = false; // set when we first lock cursor this frame
@@ -137,7 +166,46 @@ fn toggleFullscreen(window: *glfw.Window) void {
     }
 }
 
-fn sampleCameraInput(window: *glfw.Window) CameraInput {
+// Cross-platform fullscreen shortcuts (edge-triggered)
+fn handleFullscreenShortcuts(window: *glfw.Window) void {
+    const Latch = struct {
+        var altenter: bool = false;
+        var f11: bool = false;
+        var cmdctrlf: bool = false;
+    };
+
+    var toggle = false;
+
+    if (CONFIG.allow_alt_enter) {
+        const alt = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_ALT) == glfw.c.GLFW_PRESS) or
+            (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_ALT) == glfw.c.GLFW_PRESS);
+        const enter = glfw.getKey(window, glfw.c.GLFW_KEY_ENTER) == glfw.c.GLFW_PRESS;
+        const down = alt and enter;
+        if (down and !Latch.altenter) toggle = true;
+        Latch.altenter = down;
+    }
+
+    if (CONFIG.allow_f11 and !IS_MAC) {
+        const down = glfw.getKey(window, glfw.c.GLFW_KEY_F11) == glfw.c.GLFW_PRESS;
+        if (down and !Latch.f11) toggle = true;
+        Latch.f11 = down;
+    }
+
+    if (CONFIG.allow_cmd_ctrl_f_mac and IS_MAC) {
+        const cmd = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_SUPER) == glfw.c.GLFW_PRESS) or
+            (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_SUPER) == glfw.c.GLFW_PRESS);
+        const ctrl = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_CONTROL) == glfw.c.GLFW_PRESS) or
+            (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_CONTROL) == glfw.c.GLFW_PRESS);
+        const f = glfw.getKey(window, glfw.c.GLFW_KEY_F) == glfw.c.GLFW_PRESS;
+        const down = cmd and ctrl and f;
+        if (down and !Latch.cmdctrlf) toggle = true;
+        Latch.cmdctrlf = down;
+    }
+
+    if (toggle) toggleFullscreen(window);
+}
+
+fn sampleCameraInput(window: *glfw.Window, look_active: bool) CameraInput {
     var ci: CameraInput = .{};
 
     const Key = struct {
@@ -158,26 +226,25 @@ fn sampleCameraInput(window: *glfw.Window) CameraInput {
         var last_pos: ?[2]f64 = null;
     };
 
-    const rmb = glfw.getMouseButton(window, glfw.c.GLFW_MOUSE_BUTTON_RIGHT);
-    if (rmb == glfw.c.GLFW_PRESS) {
+    if (look_active) {
         const raw = glfw.getCursorPos(window);
         const pos = [2]f64{ raw.x, raw.y };
 
-        // On the exact frame we entered lock, seed last_pos and zero the delta.
         if (InputState.just_locked or CursorState.last_pos == null) {
             CursorState.last_pos = pos;
             InputState.just_locked = false;
-            return ci; // no look jump this frame
+            return ci; // suppress first-frame jump
         }
 
         const prev = CursorState.last_pos.?;
         const dx = pos[0] - prev[0];
         const dy = pos[1] - prev[1];
 
-        // Mild sensitivity (tweakable). Raw mouse makes this consistent across OS.
-        const sens: f32 = 0.12;
-        ci.look_delta_x = @as(f32, @floatCast(dx)) * sens;
-        ci.look_delta_y = @as(f32, @floatCast(dy)) * sens;
+        var y = @as(f32, @floatCast(dy)) * CONFIG.mouse_sens;
+        if (CONFIG.invert_y) y = -y;
+
+        ci.look_delta_x = @as(f32, @floatCast(dx)) * CONFIG.mouse_sens;
+        ci.look_delta_y = y;
 
         CursorState.last_pos = pos;
     } else {
@@ -352,8 +419,8 @@ fn createRenderPass(gc: *const GraphicsContext, swapchain: Swapchain, depth_form
 }
 
 // ── SPIR-V loading (robust names + logging)
-fn readFileAligned(alloc: Allocator, path: []const u8, comptime alignment: std.mem.Alignment) ![]u8 {
-    var file = try std.fs.cwd().openFile(path, .{});
+fn readFileAlignedAbsolute(alloc: Allocator, abs_path: []const u8, comptime alignment: std.mem.Alignment) ![]u8 {
+    var file = try std.fs.openFileAbsolute(abs_path, .{});
     defer file.close();
 
     const st = try file.stat();
@@ -383,7 +450,7 @@ fn loadSpirvFromExeDirAligned(alloc: Allocator, rel: []const u8) ![]u8 {
     const full = try std.fs.path.join(alloc, &.{ exe_dir, rel });
     defer alloc.free(full);
 
-    const bytes = try readFileAligned(alloc, full, .@"4");
+    const bytes = try readFileAlignedAbsolute(alloc, full, .@"4");
     if (bytes.len % 4 != 0) {
         alloc.free(bytes);
         return error.BadSpirvSize;
@@ -708,11 +775,127 @@ fn freeCmdBuffers(gc: *const GraphicsContext, A: Allocator, pool: vk.CommandPool
     }
 }
 
+// ── Small file helpers for Zig 0.16 (no std.fs.readFileAlloc)
+fn readAllAllocAbsolute(alloc: Allocator, abs_path: []const u8, max_bytes: usize) ![]u8 {
+    var file = try std.fs.openFileAbsolute(abs_path, .{});
+    defer file.close();
+
+    const st = try file.stat();
+    if (st.size == 0) return error.EmptyFile;
+    if (st.size > max_bytes) return error.FileTooBig;
+
+    const size: usize = @intCast(st.size);
+    var buf = try alloc.alloc(u8, size);
+    errdefer alloc.free(buf);
+
+    var off: usize = 0;
+    while (off < size) {
+        const n = try file.read(buf[off..]);
+        if (n == 0) break;
+        off += n;
+    }
+    if (off != size) return error.UnexpectedEof;
+
+    return buf;
+}
+
+fn readAllAllocFromDir(alloc: Allocator, dir: std.fs.Dir, sub_path: []const u8, max_bytes: usize) ![]u8 {
+    var file = try dir.openFile(sub_path, .{});
+    defer file.close();
+
+    const size_u64 = try file.getEndPos();
+    if (size_u64 == 0) return error.EmptyFile;
+    if (size_u64 > max_bytes) return error.FileTooBig;
+
+    const size: usize = @intCast(size_u64);
+    var buf = try alloc.alloc(u8, size);
+    errdefer alloc.free(buf);
+
+    var off: usize = 0;
+    while (off < size) {
+        const n = try file.read(buf[off..]);
+        if (n == 0) break;
+        off += n;
+    }
+    if (off != size) return error.UnexpectedEof;
+
+    return buf;
+}
+
+// ── Config loader
+fn loadConfig(alloc: Allocator) Config {
+    const filename = "config.json";
+    var cfg: Config = .{}; // defaults
+
+    // 1) Try executable directory
+    if (std.fs.selfExeDirPathAlloc(alloc) catch null) |exe_dir_path| {
+        defer alloc.free(exe_dir_path);
+
+        if (std.fs.path.join(alloc, &.{ exe_dir_path, filename }) catch null) |full_path| {
+            defer alloc.free(full_path);
+
+            if (readAllAllocAbsolute(alloc, full_path, 1 << 20) catch null) |bytes| {
+                defer alloc.free(bytes);
+
+                const parsed = std.json.parseFromSlice(ConfigFile, alloc, bytes, .{
+                    .ignore_unknown_fields = true,
+                }) catch {
+                    std.log.warn("config.json in exe dir: parse failed; using defaults", .{});
+                    return cfg;
+                };
+                defer parsed.deinit();
+
+                cfg = overlayConfig(cfg, parsed.value);
+                std.log.info("Loaded config.json from executable directory", .{});
+                return cfg;
+            }
+        }
+    }
+
+    // 2) Try current working directory
+    if (readAllAllocFromDir(alloc, std.fs.cwd(), filename, 1 << 20) catch null) |bytes| {
+        defer alloc.free(bytes);
+
+        const parsed = std.json.parseFromSlice(ConfigFile, alloc, bytes, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            std.log.warn("config.json in CWD: parse failed; using defaults", .{});
+            return cfg;
+        };
+        defer parsed.deinit();
+
+        cfg = overlayConfig(cfg, parsed.value);
+        std.log.info("Loaded config.json from current working directory", .{});
+        return cfg;
+    }
+
+    // 3) Nothing found → defaults
+    std.log.info("config.json not found; using defaults", .{});
+    return cfg;
+}
+
+fn overlayConfig(base: Config, file: ConfigFile) Config {
+    var out = base;
+    if (file.fov_deg) |v| out.fov_deg = v;
+    if (file.mouse_sens) |v| out.mouse_sens = v;
+    if (file.invert_y) |v| out.invert_y = v;
+    if (file.enable_raw_mouse) |v| out.enable_raw_mouse = v;
+    if (file.base_move_speed_scale) |v| out.base_move_speed_scale = v;
+    if (file.sprint_mult) |v| out.sprint_mult = v;
+    if (file.allow_alt_enter) |v| out.allow_alt_enter = v;
+    if (file.allow_f11) |v| out.allow_f11 = v;
+    if (file.allow_cmd_ctrl_f_mac) |v| out.allow_cmd_ctrl_f_mac = v;
+    return out;
+}
+
 // ── Main
 pub fn main() !void {
     _ = glfw.setErrorCallback(errorCallback);
     try glfw.init();
     defer glfw.terminate();
+
+    // Load declarative config (exe dir or cwd)
+    CONFIG = loadConfig(std.heap.c_allocator);
 
     var extent = vk.Extent2D{ .width = 1280, .height = 800 };
     glfw.defaultWindowHints();
@@ -854,10 +1037,9 @@ pub fn main() !void {
     }
 
     // Camera
-    const fovy: f32 = @floatCast(std.math.degreesToRadians(70.0));
     var camera = Camera3D.init(
         Vec3.init(0.0, 1.7, 4.0),
-        fovy,
+        @floatCast(std.math.degreesToRadians(CONFIG.fov_deg)),
         @as(f32, @floatFromInt(swapchain.extent.width)) /
             @as(f32, @floatFromInt(swapchain.extent.height)),
         0.1,
@@ -925,72 +1107,33 @@ pub fn main() !void {
     while (!glfw.windowShouldClose(window)) {
         const tick = frame_timer.tick(nowMsFromGlfw());
         var dt = @as(f32, @floatCast(tick.dt));
-        if (tick.fps_updated) {
-            var buf: [200]u8 = undefined;
-            const title = std.fmt.bufPrintZ(
-                &buf,
-                "{s} | FPS: {d:.1} | Cam: x={d:.2}, y={d:.2}, z={d:.2}",
-                .{ window_title_base, tick.fps, camera.position.x, camera.position.y, camera.position.z },
-            ) catch null;
-            if (title) |z| glfw.setWindowTitle(window, z);
+
+        // Declarative movement scaling
+        dt *= CONFIG.base_move_speed_scale;
+
+        // Sprint
+        const ls = glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_SHIFT);
+        const rs = glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_SHIFT);
+        if (ls == glfw.c.GLFW_PRESS or ls == glfw.c.GLFW_REPEAT or
+            rs == glfw.c.GLFW_PRESS or rs == glfw.c.GLFW_REPEAT)
+        {
+            dt *= CONFIG.sprint_mult;
         }
 
-        const KeyLatch = struct {
-            var f11_was_down: bool = false;
-            var altenter_was_down: bool = false;
-            var cmdctrlf_was_down: bool = false; // mac-only combo
-        };
+        // Cross-platform fullscreen
+        handleFullscreenShortcuts(window);
 
-        { // --- fullscreen toggles (cross-platform) ---
-            var should_toggle = false;
-
-            // Alt+Enter (universal)
-            const alt = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_ALT) == glfw.c.GLFW_PRESS) or
-                (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_ALT) == glfw.c.GLFW_PRESS);
-            const enter = glfw.getKey(window, glfw.c.GLFW_KEY_ENTER) == glfw.c.GLFW_PRESS;
-            const altenter = alt and enter;
-            if (altenter and !KeyLatch.altenter_was_down) should_toggle = true;
-            KeyLatch.altenter_was_down = altenter;
-
-            // F11 (Windows/Linux; skip on mac because OS often steals it)
-            const f11 = glfw.getKey(window, glfw.c.GLFW_KEY_F11) == glfw.c.GLFW_PRESS;
-            if (!IS_MAC and f11 and !KeyLatch.f11_was_down) should_toggle = true;
-            KeyLatch.f11_was_down = f11;
-
-            // macOS: Cmd+Ctrl+F (matches native convention)
-            if (IS_MAC) {
-                const cmd = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_SUPER) == glfw.c.GLFW_PRESS) or
-                    (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_SUPER) == glfw.c.GLFW_PRESS);
-                const ctrl = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_CONTROL) == glfw.c.GLFW_PRESS) or
-                    (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_CONTROL) == glfw.c.GLFW_PRESS);
-                const f = glfw.getKey(window, glfw.c.GLFW_KEY_F) == glfw.c.GLFW_PRESS;
-                const cmdctrlf = cmd and ctrl and f;
-                if (cmdctrlf and !KeyLatch.cmdctrlf_was_down) should_toggle = true;
-                KeyLatch.cmdctrlf_was_down = cmdctrlf;
-            }
-
-            if (should_toggle) toggleFullscreen(window);
-        }
-
+        // Quit
         const esc = glfw.getKey(window, glfw.c.GLFW_KEY_ESCAPE);
         if (esc == glfw.c.GLFW_PRESS or esc == glfw.c.GLFW_REPEAT) glfw.setWindowShouldClose(window, true);
 
-        const ls = glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_SHIFT);
-        const rs = glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_SHIFT);
-        if (ls == glfw.c.GLFW_PRESS or ls == glfw.c.GLFW_REPEAT or rs == glfw.c.GLFW_PRESS or rs == glfw.c.GLFW_REPEAT) {
-            dt *= 2.5;
-        }
-
         // --- FPS mouse lock & raw mouse motion ---
-        const rmb_state = glfw.getMouseButton(window, glfw.c.GLFW_MOUSE_BUTTON_RIGHT);
-        const want_lock = (rmb_state == glfw.c.GLFW_PRESS);
+        const rmb_down = (glfw.getMouseButton(window, glfw.c.GLFW_MOUSE_BUTTON_RIGHT) == glfw.c.GLFW_PRESS);
 
-        if (want_lock and !LockState.locked) {
-            // Enter lock: hide & confine cursor for proper FPS look
+        if (rmb_down and !LockState.locked) {
             glfw.setInputMode(window, glfw.c.GLFW_CURSOR, glfw.c.GLFW_CURSOR_DISABLED);
 
-            // Enable raw mouse motion once (if supported)
-            if (!InputState.raw_mouse_checked) {
+            if (CONFIG.enable_raw_mouse and !InputState.raw_mouse_checked) {
                 InputState.raw_mouse_checked = true;
                 if (glfw.rawMouseMotionSupported()) {
                     glfw.setInputMode(window, glfw.c.GLFW_RAW_MOUSE_MOTION, glfw.c.GLFW_TRUE);
@@ -1003,13 +1146,12 @@ pub fn main() !void {
 
             InputState.just_locked = true; // suppress first-frame jump
             LockState.locked = true;
-        } else if (!want_lock and LockState.locked) {
-            // Exit lock: restore normal cursor
+        } else if (!rmb_down and LockState.locked) {
             glfw.setInputMode(window, glfw.c.GLFW_CURSOR, glfw.c.GLFW_CURSOR_NORMAL);
             LockState.locked = false;
         }
 
-        const input = sampleCameraInput(window);
+        const input = sampleCameraInput(window, rmb_down);
         camera.update(dt, input);
 
         // Update UBO (VP); projection unchanged (flip handled by viewport).
@@ -1020,6 +1162,17 @@ pub fn main() !void {
             defer gc.vkd.unmapMemory(gc.dev, ubo_mem);
             const u: *CameraUBO = @ptrCast(@alignCast(ptr));
             u.* = .{ .vp = vp.m };
+        }
+
+        // (optional) title: FPS only (minimal)
+        if (tick.fps_updated) {
+            var buf: [200]u8 = undefined;
+            const title = std.fmt.bufPrintZ(
+                &buf,
+                "{s} | FPS: {d:.1}",
+                .{ window_title_base, tick.fps },
+            ) catch null;
+            if (title) |z| glfw.setWindowTitle(window, z);
         }
 
         // Record

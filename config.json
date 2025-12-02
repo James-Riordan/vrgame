@@ -1,0 +1,11 @@
+{
+  "fov_deg": 74.0,
+  "mouse_sens": 0.10,
+  "invert_y": false,
+  "enable_raw_mouse": true,
+  "base_move_speed_scale": 1.0,
+  "sprint_mult": 2.5,
+  "allow_alt_enter": true,
+  "allow_f11": true,
+  "allow_cmd_ctrl_f_mac": true
+}
