@@ -50,6 +50,12 @@ const CameraUBO = extern struct { vp: [16]f32 };
 const VIEWPORT_Y_FLIP: bool = true;
 const PROJECTION_Y_FLIP: bool = false;
 
+const InputState = struct {
+    var just_locked: bool = false; // set when we first lock cursor this frame
+    var raw_mouse_enabled: bool = false;
+    var raw_mouse_checked: bool = false;
+};
+
 // ── Clock helpers
 fn nowMsFromGlfw() i64 {
     return @as(i64, @intFromFloat(glfw.getTime() * 1000.0));
@@ -82,12 +88,14 @@ fn waitForNonZeroFramebuffer(window: *glfw.Window) void {
 
 fn sampleCameraInput(window: *glfw.Window) CameraInput {
     var ci: CameraInput = .{};
+
     const Key = struct {
         fn isDown(w: *glfw.Window, key: c_int) bool {
             const s = glfw.getKey(w, key);
             return s == glfw.c.GLFW_PRESS or s == glfw.c.GLFW_REPEAT;
         }
     };
+
     if (Key.isDown(window, glfw.c.GLFW_KEY_W)) ci.move_forward = true;
     if (Key.isDown(window, glfw.c.GLFW_KEY_S)) ci.move_backward = true;
     if (Key.isDown(window, glfw.c.GLFW_KEY_A)) ci.move_left = true;
@@ -98,20 +106,33 @@ fn sampleCameraInput(window: *glfw.Window) CameraInput {
     const CursorState = struct {
         var last_pos: ?[2]f64 = null;
     };
+
     const rmb = glfw.getMouseButton(window, glfw.c.GLFW_MOUSE_BUTTON_RIGHT);
     if (rmb == glfw.c.GLFW_PRESS) {
         const raw = glfw.getCursorPos(window);
         const pos = [2]f64{ raw.x, raw.y };
-        if (CursorState.last_pos) |prev| {
-            const dx = pos[0] - prev[0];
-            const dy = pos[1] - prev[1];
-            ci.look_delta_x = @as(f32, @floatCast(dx));
-            ci.look_delta_y = @as(f32, @floatCast(dy));
+
+        // On the exact frame we entered lock, seed last_pos and zero the delta.
+        if (InputState.just_locked or CursorState.last_pos == null) {
+            CursorState.last_pos = pos;
+            InputState.just_locked = false;
+            return ci; // no look jump this frame
         }
+
+        const prev = CursorState.last_pos.?;
+        const dx = pos[0] - prev[0];
+        const dy = pos[1] - prev[1];
+
+        // Mild sensitivity (tweakable). Raw mouse makes this consistent across OS.
+        const sens: f32 = 0.12;
+        ci.look_delta_x = @as(f32, @floatCast(dx)) * sens;
+        ci.look_delta_y = @as(f32, @floatCast(dy)) * sens;
+
         CursorState.last_pos = pos;
     } else {
         CursorState.last_pos = null;
     }
+
     return ci;
 }
 
@@ -850,6 +871,38 @@ pub fn main() !void {
         const rs = glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_SHIFT);
         if (ls == glfw.c.GLFW_PRESS or ls == glfw.c.GLFW_REPEAT or rs == glfw.c.GLFW_PRESS or rs == glfw.c.GLFW_REPEAT) {
             dt *= 2.5;
+        }
+
+        // --- FPS mouse lock & raw mouse motion ---
+        const rmb_state = glfw.getMouseButton(window, glfw.c.GLFW_MOUSE_BUTTON_RIGHT);
+        const want_lock = (rmb_state == glfw.c.GLFW_PRESS);
+
+        const LockState = struct {
+            var locked: bool = false;
+        };
+
+        if (want_lock and !LockState.locked) {
+            // Enter lock: hide & confine cursor for proper FPS look
+            glfw.setInputMode(window, glfw.c.GLFW_CURSOR, glfw.c.GLFW_CURSOR_DISABLED);
+
+            // Enable raw mouse motion once (if supported)
+            if (!InputState.raw_mouse_checked) {
+                InputState.raw_mouse_checked = true;
+                if (glfw.rawMouseMotionSupported()) {
+                    glfw.setInputMode(window, glfw.c.GLFW_RAW_MOUSE_MOTION, glfw.c.GLFW_TRUE);
+                    InputState.raw_mouse_enabled = true;
+                    std.log.info("Raw mouse: ENABLED", .{});
+                } else {
+                    std.log.info("Raw mouse: NOT SUPPORTED on this platform", .{});
+                }
+            }
+
+            InputState.just_locked = true; // suppress first-frame jump
+            LockState.locked = true;
+        } else if (!want_lock and LockState.locked) {
+            // Exit lock: restore normal cursor
+            glfw.setInputMode(window, glfw.c.GLFW_CURSOR, glfw.c.GLFW_CURSOR_NORMAL);
+            LockState.locked = false;
         }
 
         const input = sampleCameraInput(window);
