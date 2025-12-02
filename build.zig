@@ -181,7 +181,11 @@ fn ensureXrRegistry(b: *std.Build) std.Build.LazyPath {
 // Shader build (GLSL → SPIR-V) into zig-out/bin/shaders
 // ──────────────────────────────────────────────────────────────────────────────
 //
-fn addShaderBuildSteps(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step {
+fn addShaderBuildSteps(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    is_macos: bool,
+) *std.Build.Step {
     var glslc_path: ?[]const u8 = null;
     if (b.findProgram(&.{"glslc"}, &.{}) catch null) |p| {
         glslc_path = p;
@@ -200,11 +204,12 @@ fn addShaderBuildSteps(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.S
 
     const shaders_step = b.step("shaders", "Build or stage SPIR-V into zig-out/bin/shaders");
 
-    if (glslc_path) |gl| {
+    if (glslc_path) |gl_found| {
         const mk = struct {
             fn compileOne(
                 builder: *std.Build,
                 gl_path: []const u8,
+                mac: bool,
                 comptime stage_name: []const u8, // "vert" or "frag" (must be comptime)
                 src_rel: []const u8, // e.g. "shaders/basic_lit.vert"
                 out_name: []const u8, // e.g. "basic_lit.vert.spv"
@@ -215,9 +220,14 @@ fn addShaderBuildSteps(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.S
                 inst: *std.Build.Step.InstallFile,
             } {
                 // Build the one-token flag at comptime
-                var cmd = builder.addSystemCommand(
-                    &.{ gl_path, "-O", "-c", "-fshader-stage=" ++ stage_name },
-                );
+                var cmd = builder.addSystemCommand(&.{ gl_path, "-O", "-c", "-fshader-stage=" ++ stage_name });
+
+                // Platform-specific UBO binding (macOS needs binding=1 to avoid Metal buffer(0) conflict)
+                if (mac) {
+                    cmd.addArg("-DUBO_BINDING=1");
+                } else {
+                    cmd.addArg("-DUBO_BINDING=0");
+                }
 
                 // Track the GLSL file contents so edits trigger rebuilds
                 const src_lp = builder.path(src_rel);
@@ -231,13 +241,10 @@ fn addShaderBuildSteps(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.S
             }
         };
 
-        const tri_v = mk.compileOne(b, gl, "vert", "shaders/triangle.vert", "triangle.vert.spv", "shaders/triangle.vert.spv");
-
-        const tri_f = mk.compileOne(b, gl, "frag", "shaders/triangle.frag", "triangle.frag.spv", "shaders/triangle.frag.spv");
-
-        const bl_v = mk.compileOne(b, gl, "vert", "shaders/basic_lit.vert", "basic_lit.vert.spv", "shaders/basic_lit.vert.spv");
-
-        const bl_f = mk.compileOne(b, gl, "frag", "shaders/basic_lit.frag", "basic_lit.frag.spv", "shaders/basic_lit.frag.spv");
+        const tri_v = mk.compileOne(b, gl_found, is_macos, "vert", "shaders/triangle.vert", "triangle.vert.spv", "shaders/triangle.vert.spv");
+        const tri_f = mk.compileOne(b, gl_found, is_macos, "frag", "shaders/triangle.frag", "triangle.frag.spv", "shaders/triangle.frag.spv");
+        const bl_v = mk.compileOne(b, gl_found, is_macos, "vert", "shaders/basic_lit.vert", "basic_lit.vert.spv", "shaders/basic_lit.vert.spv");
+        const bl_f = mk.compileOne(b, gl_found, is_macos, "frag", "shaders/basic_lit.frag", "basic_lit.frag.spv", "shaders/basic_lit.frag.spv");
 
         inline for ([_]@TypeOf(tri_v){ tri_v, tri_f, bl_v, bl_f }) |x| {
             shaders_step.dependOn(&x.cmd.step);
@@ -330,12 +337,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // const game_mod = b.createModule(.{
-    //     .root_source_file = b.path("src/game/game.zig"),
-    //     .target = target,
-    //     .optimize = optimize,
-    // });
-
     const camera3d_mod = b.createModule(.{
         .root_source_file = b.path("src/game/camera3d.zig"),
         .target = target,
@@ -352,7 +353,6 @@ pub fn build(b: *std.Build) void {
     vrgame_root.addImport("swapchain", swapchain_mod);
     vrgame_root.addImport("vertex", vertex_mod);
     vrgame_root.addImport("frame_time", frame_time_mod);
-    // vrgame_root.addImport("game", game_mod);
     vrgame_root.addImport("math3d", math3d_mod);
     vrgame_root.addImport("camera3d", camera3d_mod);
 
@@ -369,7 +369,6 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("swapchain", swapchain_mod);
     exe_mod.addImport("vertex", vertex_mod);
     exe_mod.addImport("frame_time", frame_time_mod);
-    // exe_mod.addImport("game", game_mod);
     exe_mod.addImport("vrgame", vrgame_root);
     exe_mod.addImport("math3d", math3d_mod);
     exe_mod.addImport("camera3d", camera3d_mod);
@@ -389,8 +388,9 @@ pub fn build(b: *std.Build) void {
     // Install exe
     b.installArtifact(exe);
 
-    // Shaders → zig-out/bin/shaders
-    const shaders_step = addShaderBuildSteps(b, exe);
+    // Shaders → zig-out/bin/shaders (pass UBO_BINDING macro per-OS)
+    const is_macos = (target.result.os.tag == .macos);
+    const shaders_step = addShaderBuildSteps(b, exe, is_macos);
 
     // Run
     const run_cmd = b.addRunArtifact(exe);
@@ -412,7 +412,6 @@ pub fn build(b: *std.Build) void {
     const run_swapchain_tests = addTestRun(b, swapchain_mod);
     const run_vertex_tests = addTestRun(b, vertex_mod);
     const run_frame_time_tests = addTestRun(b, frame_time_mod);
-    // const run_game_tests = addTestRun(b, game_mod);
     const run_vrgame_root_tests = addTestRun(b, vrgame_root);
     const run_math3d_tests = addTestRun(b, math3d_mod);
     const run_camera3d_tests = addTestRun(b, camera3d_mod);
@@ -423,7 +422,6 @@ pub fn build(b: *std.Build) void {
         run_swapchain_tests,
         run_vertex_tests,
         run_frame_time_tests,
-        // run_game_tests,
         run_vrgame_root_tests,
         run_math3d_tests,
         run_camera3d_tests,
@@ -437,7 +435,6 @@ pub fn build(b: *std.Build) void {
     unit_step.dependOn(&run_swapchain_tests.step);
     unit_step.dependOn(&run_vertex_tests.step);
     unit_step.dependOn(&run_frame_time_tests.step);
-    // unit_step.dependOn(&run_game_tests.step);
     unit_step.dependOn(&run_vrgame_root_tests.step);
     unit_step.dependOn(&run_math3d_tests.step);
     unit_step.dependOn(&run_camera3d_tests.step);
@@ -461,7 +458,6 @@ pub fn build(b: *std.Build) void {
         integration_mod.addImport("math3d", math3d_mod);
         integration_mod.addImport("vertex", vertex_mod);
         integration_mod.addImport("frame_time", frame_time_mod);
-        // integration_mod.addImport("game", game_mod);
         integration_mod.addImport("vrgame", vrgame_root);
         integration_mod.addImport("camera3d", camera3d_mod);
 
@@ -491,7 +487,6 @@ pub fn build(b: *std.Build) void {
         e2e_mod.addImport("swapchain", swapchain_mod);
         e2e_mod.addImport("vertex", vertex_mod);
         e2e_mod.addImport("frame_time", frame_time_mod);
-        // e2e_mod.addImport("game", game_mod);
         e2e_mod.addImport("vrgame", vrgame_root);
         e2e_mod.addImport("math3d", math3d_mod);
         e2e_mod.addImport("camera3d", camera3d_mod);

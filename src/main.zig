@@ -588,12 +588,12 @@ fn createPipeline(gc: *const GraphicsContext, layout: vk.PipelineLayout, render_
     const A = std.heap.c_allocator;
 
     const vert_candidates = [_][]const u8{
-        "shaders/basic_lit_vert",
         "shaders/basic_lit.vert.spv",
+        "shaders/basic_lit_vert",
     };
     const frag_candidates = [_][]const u8{
-        "shaders/basic_lit_frag",
         "shaders/basic_lit.frag.spv",
+        "shaders/basic_lit_frag",
     };
 
     const vert_bytes = try loadFirstSpirv(A, "VERT", &vert_candidates);
@@ -1048,9 +1048,11 @@ pub fn main() !void {
     });
     defer depth_res.destroy(gc.vkd, gc.dev, null);
 
-    // Descriptor set layout (SceneUBO at set=0, binding=0)
+    // ---- Descriptor set layout (SceneUBO at set=0, binding=mac?1:0)
+    const ubo_binding_index: u32 = if (IS_MAC) 1 else 0;
+
     const ubo_binding = vk.DescriptorSetLayoutBinding{
-        .binding = 0,
+        .binding = ubo_binding_index,
         .descriptor_type = .uniform_buffer,
         .descriptor_count = 1,
         .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
@@ -1191,7 +1193,7 @@ pub fn main() !void {
     const ubo_info = vk.DescriptorBufferInfo{ .buffer = ubo_buf, .offset = 0, .range = ubo_size };
     const write = vk.WriteDescriptorSet{
         .dst_set = set,
-        .dst_binding = 0,
+        .dst_binding = ubo_binding_index,
         .dst_array_element = 0,
         .descriptor_count = 1,
         .descriptor_type = .uniform_buffer,
