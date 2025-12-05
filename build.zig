@@ -138,77 +138,95 @@ fn ensureXrRegistry(b: *std.Build) std.Build.LazyPath {
     return b.path(rel);
 }
 
-//
-// ──────────────────────────────────────────────────────────────────────────────
-// Small util: does a relative file exist?
-// ──────────────────────────────────────────────────────────────────────────────
-//
 fn fileExists(rel: []const u8) bool {
     _ = std.fs.cwd().access(rel, .{}) catch return false;
     return true;
 }
 
-//
-// ──────────────────────────────────────────────────────────────────────────────
-// Shader build/stage: put SPIR-V into zig-out/bin/shaders
-// ──────────────────────────────────────────────────────────────────────────────
-//
+fn detectStage(stem: []const u8) ?[]const u8 {
+    if (std.mem.endsWith(u8, stem, ".vert")) return "vert";
+    if (std.mem.endsWith(u8, stem, ".frag")) return "frag";
+    return null;
+}
+
 fn addShaderBuildSteps(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
+    target: std.Build.ResolvedTarget,
 ) *std.Build.Step {
-    // Try to locate glslc; if absent we’ll just stage prebuilt .spv files.
+    const SRC_DIRS = [_][]const u8{ "assets/shaders", "shaders" };
+
     const glslc: ?[]const u8 = b.findProgram(&.{"glslc"}, &.{}) catch null;
     if (glslc) |p| {
         std.log.info("Using glslc at {s}", .{p});
     } else {
-        std.log.warn("glslc not found; will only stage existing .spv files from assets/shaders", .{});
+        std.log.warn("glslc not found; will only stage existing .spv files from {s}/ or {s}/", .{ SRC_DIRS[0], SRC_DIRS[1] });
     }
 
     const shaders_step = b.step("shaders", "Build or stage SPIR-V into zig-out/bin/shaders");
 
-    // Source directory and shader list (add more pairs as needed).
-    const SRC_DIR = "assets/shaders";
-    const items = [_][2][]const u8{
-        .{ "basic_lit.vert", "vert" },
-        .{ "basic_lit.frag", "frag" },
-        .{ "triangle.vert", "vert" },
-        .{ "triangle.frag", "frag" },
+    const stems = [_][]const u8{
+        "DEBUG_flat.vert",
+        "DEBUG_flat.frag",
+        "basic_lit.vert",
+        "basic_lit.frag",
+        "triangle.vert",
+        "triangle.frag",
     };
 
-    for (items) |pair| {
-        const stem = pair[0]; // e.g. "basic_lit.vert"
-        const stage = pair[1]; // "vert" or "frag"
+    const is_macos = (target.result.os.tag == .macos);
+    const ubo_binding = if (is_macos) "1" else "0";
+    const tex_binding = if (is_macos) "0" else "1";
 
-        const src_glsl_rel = b.fmt("{s}/{s}", .{ SRC_DIR, stem });
-        const src_spv_rel = b.fmt("{s}/{s}.spv", .{ SRC_DIR, stem });
+    var missing_count: usize = 0;
+
+    // NOTE: plain `for` (runtime in the build runner) — no comptime control flow.
+    for (stems) |stem| {
+        const stage = detectStage(stem) orelse {
+            std.log.warn("Unknown shader stage for {s}; expected .vert or .frag", .{stem});
+            missing_count += 1;
+            continue;
+        };
+
         const out_spv_name = b.fmt("{s}.spv", .{stem});
         const install_dest = b.fmt("shaders/{s}", .{out_spv_name});
 
-        if (glslc != null and fileExists(src_glsl_rel)) {
-            var cmd = b.addSystemCommand(&.{ glslc.?, "-O", "-c", b.fmt("-fshader-stage={s}", .{stage}) });
+        var found = false;
 
-            // Descriptor bindings must match src/main.zig:
-            // set = 0, binding 0 → UBO, binding 1 → sampler
-            cmd.addArg("-DUBO_BINDING=0");
-            cmd.addArg("-DTEX_BINDING=1");
+        for (SRC_DIRS) |src_dir| {
+            const src_glsl_rel = b.fmt("{s}/{s}", .{ src_dir, stem });
+            const src_spv_rel = b.fmt("{s}/{s}.spv", .{ src_dir, stem });
 
-            cmd.addFileArg(b.path(src_glsl_rel));
-            cmd.addArg("-o");
-            const out_lp = cmd.addOutputFileArg(out_spv_name);
+            if (glslc != null and fileExists(src_glsl_rel)) {
+                var cmd = b.addSystemCommand(&.{ glslc.?, "-O", "-c", b.fmt("-fshader-stage={s}", .{stage}) });
+                cmd.addArg(b.fmt("-DUBO_BINDING={s}", .{ubo_binding}));
+                cmd.addArg(b.fmt("-DTEX_BINDING={s}", .{tex_binding}));
+                cmd.addFileArg(b.path(src_glsl_rel));
+                cmd.addArg("-o");
+                const out_lp = cmd.addOutputFileArg(out_spv_name);
 
-            const inst = b.addInstallFileWithDir(out_lp, .bin, install_dest);
-            shaders_step.dependOn(&cmd.step);
-            shaders_step.dependOn(&inst.step);
-        } else if (fileExists(src_spv_rel)) {
-            const inst2 = b.addInstallFileWithDir(b.path(src_spv_rel), .bin, install_dest);
-            shaders_step.dependOn(&inst2.step);
-        } else {
-            std.log.warn("Shader missing: {s} (no {s} or {s})", .{ stem, src_glsl_rel, src_spv_rel });
+                const inst = b.addInstallFileWithDir(out_lp, .bin, install_dest);
+                shaders_step.dependOn(&cmd.step);
+                shaders_step.dependOn(&inst.step);
+                found = true;
+                break; // break inner loop (runtime)
+            }
+
+            if (fileExists(src_spv_rel)) {
+                const inst2 = b.addInstallFileWithDir(b.path(src_spv_rel), .bin, install_dest);
+                shaders_step.dependOn(&inst2.step);
+                found = true;
+                break; // break inner loop (runtime)
+            }
+        }
+
+        if (!found) {
+            std.log.warn("Shader missing: {s} (looked in {s}/ and {s}/)", .{ stem, SRC_DIRS[0], SRC_DIRS[1] });
+            missing_count += 1;
         }
     }
 
-    // Ensure the executable won’t run before shaders are present.
+    // Ensure the exe won’t run before shaders are staged/built.
     exe.step.dependOn(shaders_step);
     return shaders_step;
 }
@@ -377,7 +395,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     // Shaders (compile if sources exist; else stage precompiled .spv)
-    const shaders_step = addShaderBuildSteps(b, exe);
+    const shaders_step = addShaderBuildSteps(b, exe, target);
 
     // Run
     const run_cmd = b.addRunArtifact(exe);
