@@ -115,19 +115,15 @@ pub const Swapchain = struct {
     pub fn cmdSetViewportAndScissor(self: *const Swapchain, gc: *const GraphicsContext, cmd: vk.CommandBuffer) void {
         const w: f32 = @floatFromInt(self.extent.width);
         const h: f32 = @floatFromInt(self.extent.height);
-        const is_macos = @import("builtin").os.tag == .macos;
 
-        // Windows/Linux: negative height flips Y.
-        // macOS: positive height (no flip here; projection handles it).
         var viewport = vk.Viewport{
             .x = 0,
-            .y = if (is_macos) 0 else h,
+            .y = h,
             .width = w,
-            .height = if (is_macos) h else -h,
+            .height = -h,
             .min_depth = 0,
             .max_depth = 1,
         };
-
         const scissor = vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = self.extent };
 
         gc.vkd.cmdSetViewport(cmd, 0, 1, @as([*]const vk.Viewport, @ptrCast(&viewport)));

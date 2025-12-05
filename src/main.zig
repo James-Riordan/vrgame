@@ -31,8 +31,8 @@ const IS_MAC = builtin.os.tag == .macos;
 
 // Windows/Linux → viewport flip
 // macOS/MoltenVK → projection flip
-const VIEWPORT_Y_FLIP: bool = !IS_MAC;
-const PROJECTION_Y_FLIP: bool = IS_MAC;
+const VIEWPORT_Y_FLIP: bool = true;
+const PROJECTION_Y_FLIP: bool = false;
 
 comptime {
     if (IS_MAC) {
@@ -1420,23 +1420,18 @@ pub fn main() !void {
         try gc.vkd.beginCommandBuffer(cmdbuf, &vk.CommandBufferBeginInfo{ .flags = .{}, .p_inheritance_info = null });
 
         const fb_extent = swapchain.extent;
-
         const w: f32 = @floatFromInt(fb_extent.width);
         const h: f32 = @floatFromInt(fb_extent.height);
 
         var viewport = vk.Viewport{
             .x = 0,
-            .y = if (VIEWPORT_Y_FLIP) h else 0,
+            .y = h, // start at bottom
             .width = w,
-            .height = if (VIEWPORT_Y_FLIP) -h else h,
+            .height = -h, // flip Y
             .min_depth = 0,
             .max_depth = 1,
         };
-
-        const scissor = vk.Rect2D{
-            .offset = .{ .x = 0, .y = 0 },
-            .extent = fb_extent,
-        };
+        const scissor = vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = fb_extent };
 
         const clear_color = vk.ClearValue{ .color = .{ .float_32 = .{ 0.05, 0.05, 0.07, 1.0 } } };
         const clear_depth = vk.ClearValue{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } };
