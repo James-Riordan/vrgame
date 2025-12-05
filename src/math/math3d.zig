@@ -97,7 +97,7 @@ pub const Mat4 = struct {
     /// Column-major 4x4 matrix: m[col*4 + row]
     m: [16]f32,
 
-    inline fn idx(row: usize, col: usize) usize {
+    pub inline fn idx(row: usize, col: usize) usize {
         return col * 4 + row;
     }
 
@@ -163,7 +163,10 @@ pub const Mat4 = struct {
         return v4.toVec3();
     }
 
-    /// Right-handed perspective (Vulkan/D3D Z in [0,1]).
+    /// Right-handed perspective **for Vulkan/D3D** where clip Z ∈ [0,1].
+    /// If any path still emits a GL-style projection (Z∈[-1,1]), either:
+    ///  - switch that code to use this function, OR
+    ///  - multiply by `Mat4.glToVkClip()` once afterward.
     pub fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) Mat4 {
         const f = 1.0 / @tan(fov_y / 2.0);
         var m = Mat4{ .m = [_]f32{0} ** 16 };
@@ -173,10 +176,15 @@ pub const Mat4 = struct {
         m.m[idx(1, 1)] = f;
 
         // Depth (RH, Vulkan/D3D clip: z in [0,1])
+        // Column-major positions:
+        // [ m00 m01 m02 m03 ]
+        // [ m10 m11 m12 m13 ]
+        // [ m20 m21 m22 m23 ]
+        // [ m30 m31 m32 m33 ]
         m.m[idx(2, 2)] = far / (near - far); // m22
-        m.m[idx(3, 2)] = -1.0; // m32  <-- moved here
-        m.m[idx(2, 3)] = (far * near) / (near - far); // m23  <-- moved here
-        m.m[idx(3, 3)] = 0.0;
+        m.m[idx(2, 3)] = (far * near) / (near - far); // m23
+        m.m[idx(3, 2)] = -1.0; // m32
+        m.m[idx(3, 3)] = 0.0; // m33
 
         return m;
     }
@@ -207,6 +215,30 @@ pub const Mat4 = struct {
         r.m[idx(2, 3)] = f.dot(eye);
         r.m[idx(3, 3)] = 1.0;
 
+        return r;
+    }
+
+    /// Multiply on the left by a constant GL→Vulkan clip conversion.
+    /// Use this only if your projection was built for GL (Z∈[-1,1]).
+    pub fn toVulkanClip(self: Mat4) Mat4 {
+        return Mat4.mul(glToVkClip(), self);
+    }
+
+    /// Return the GL→Vulkan clip matrix (column-major).
+    /// Maps z_ndc from [-1,+1] to [0,+1] while leaving x,y,w unchanged.
+    pub fn glToVkClip() Mat4 {
+        return .{ .m = .{
+            1, 0, 0,   0,
+            0, 1, 0,   0,
+            0, 0, 0.5, 0,
+            0, 0, 0.5, 1,
+        } };
+    }
+
+    /// Return a copy with projection Y flipped (multiply m11 by -1).
+    pub fn flippedY(self: Mat4) Mat4 {
+        var r = self;
+        r.m[idx(1, 1)] = -r.m[idx(1, 1)];
         return r;
     }
 
@@ -287,7 +319,3 @@ test "Mat4 identity invariants (I*M==M && M*I==M)" {
         try std.testing.expectApproxEqAbs(M.m[k], MI.m[k], 1e-5);
     }
 }
-
-// test "refAllDecls(math3d)" {
-//     std.testing.refAllDecls(@This());
-// }

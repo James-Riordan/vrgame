@@ -65,12 +65,13 @@ pub const Swapchain = struct {
         return &self.swap_images[self.image_index];
     }
 
+    /// Submit + present current image, then acquire the next one and rotate semaphores.
     pub fn present(self: *Swapchain, cmdbuf: vk.CommandBuffer) !PresentState {
         const current = self.currentSwapImage();
         try current.waitForFence(self.gc);
         try self.gc.vkd.resetFences(self.gc.dev, 1, @ptrCast(&current.frame_fence));
 
-        const wait_stage = [_]vk.PipelineStageFlags{.{ .top_of_pipe_bit = true }};
+        const wait_stage = [_]vk.PipelineStageFlags{.{ .color_attachment_output_bit = true }};
         try self.gc.vkd.queueSubmit(self.gc.graphics_queue.handle, 1, &[_]vk.SubmitInfo{.{
             .wait_semaphore_count = 1,
             .p_wait_semaphores = @ptrCast(&current.image_acquired),
@@ -112,11 +113,11 @@ pub const Swapchain = struct {
         };
     }
 
+    /// Convenience: dynamic viewport/scissor that handles MoltenVK vs classic Vulkan Y-flip.
     pub fn cmdSetViewportAndScissor(self: *const Swapchain, gc: *const GraphicsContext, cmd: vk.CommandBuffer) void {
         const w: f32 = @floatFromInt(self.extent.width);
         const h: f32 = @floatFromInt(self.extent.height);
 
-        // MoltenVK wants a normal (non-flipped) viewport; others use the classic Vulkan flip.
         const is_macos = @import("builtin").os.tag == .macos;
 
         var viewport = vk.Viewport{
@@ -188,7 +189,8 @@ const SwapImage = struct {
         gc.vkd.destroyFence(gc.dev, self.frame_fence, null);
     }
 
-    fn waitForFence(self: SwapImage, gc: *const GraphicsContext) !void {
+    /// Exposed so caller can explicitly synchronize if desired.
+    pub fn waitForFence(self: SwapImage, gc: *const GraphicsContext) !void {
         _ = try gc.vkd.waitForFences(
             gc.dev,
             1,
@@ -213,7 +215,7 @@ fn buildSwapchain(
         return error.InvalidSurfaceDimensions;
 
     const surface_format = try findSurfaceFormat(gc, allocator);
-    const present_mode = try findPresentMode(gc, allocator);
+    const present_mode = try findPresentMode(gc, allocator); // returns fifo_khr for robustness
 
     var image_count = caps.min_image_count + 1;
     if (caps.max_image_count > 0) image_count = @min(image_count, caps.max_image_count);
@@ -262,7 +264,7 @@ fn buildSwapchain(
 
     std.mem.swap(vk.Semaphore, &swap_images[result.image_index].image_acquired, &next_image_acquired);
 
-    return .{
+    const sc = Swapchain{
         .gc = gc,
         .allocator = allocator,
         .surface_format = surface_format,
@@ -273,6 +275,20 @@ fn buildSwapchain(
         .image_index = result.image_index,
         .next_image_acquired = next_image_acquired,
     };
+
+    std.log.info(
+        "Swapchain: extent={d}x{d} | format={s} | present_mode={s} | images={d} | first index={d}",
+        .{
+            sc.extent.width,
+            sc.extent.height,
+            @tagName(sc.surface_format.format),
+            @tagName(sc.present_mode),
+            sc.swap_images.len,
+            sc.image_index,
+        },
+    );
+
+    return sc;
 }
 
 fn initSwapchainImages(gc: *const GraphicsContext, swapchain: vk.SwapchainKHR, format: vk.Format, allocator: Allocator) ![]SwapImage {
@@ -308,17 +324,17 @@ fn findSurfaceFormat(gc: *const GraphicsContext, allocator: Allocator) !vk.Surfa
     return surface_formats[0];
 }
 
+/// Robust choice: always prefer FIFO (vsync). It's guaranteed by the spec and avoids timing quirks
+/// seen with .mailbox_khr / .immediate_khr while stabilizing synchronization.
 fn findPresentMode(gc: *const GraphicsContext, allocator: Allocator) !vk.PresentModeKHR {
-    var count: u32 = undefined;
+    // Query (kept for future configurability / diagnostics)
+    var count: u32 = 0;
     _ = try gc.vki.getPhysicalDeviceSurfacePresentModesKHR(gc.pdev, gc.surface, &count, null);
-    const present_modes = try allocator.alloc(vk.PresentModeKHR, count);
-    defer allocator.free(present_modes);
-    _ = try gc.vki.getPhysicalDeviceSurfacePresentModesKHR(gc.pdev, gc.surface, &count, present_modes.ptr);
+    const modes = try allocator.alloc(vk.PresentModeKHR, count);
+    defer allocator.free(modes);
+    _ = try gc.vki.getPhysicalDeviceSurfacePresentModesKHR(gc.pdev, gc.surface, &count, modes.ptr);
 
-    const preferred = [_]vk.PresentModeKHR{ .mailbox_khr, .immediate_khr };
-    for (preferred) |mode| {
-        if (std.mem.indexOfScalar(vk.PresentModeKHR, present_modes, mode) != null) return mode;
-    }
+    // Hard, robust default:
     return .fifo_khr;
 }
 

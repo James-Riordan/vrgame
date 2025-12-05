@@ -1,16 +1,16 @@
 #version 450
-
-layout(location = 0) in vec3 inPos;    // Vertex.pos
-layout(location = 1) in vec3 inColor;  // Vertex.color
-
-// Matches Zig: extern struct { m: [16]f32 }  (column-major mat4)
-layout(push_constant) uniform Push {
-    mat4 VP;
-} pc;
-
-layout(location = 0) out vec3 vColor;
-
+layout(location = 0) out vec3 v_color;
 void main() {
-    gl_Position = pc.VP * vec4(inPos, 1.0);
-    vColor = inColor;
+    const vec2 P[3] = vec2[](
+        vec2(-0.8, -0.6),
+        vec2( 0.8, -0.6),
+        vec2( 0.0,  0.6)
+    );
+    const vec3 C[3] = vec3[](
+        vec3(1,0,0),
+        vec3(0,1,0),
+        vec3(1,0,1)
+    );
+    gl_Position = vec4(P[gl_VertexIndex], 0.0, 1.0);
+    v_color = C[gl_VertexIndex];
 }

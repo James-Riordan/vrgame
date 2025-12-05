@@ -2,7 +2,7 @@ const std = @import("std");
 
 //
 // ──────────────────────────────────────────────────────────────────────────────
-// Platform helpers
+// Vulkan loader linking
 // ──────────────────────────────────────────────────────────────────────────────
 //
 fn linkVulkanLoader(
@@ -12,7 +12,6 @@ fn linkVulkanLoader(
 ) void {
     switch (target.result.os.tag) {
         .windows => {
-            // Add %VULKAN_SDK%\Lib if present (helps the linker find 'vulkan-1').
             if (std.process.getEnvVarOwned(b.allocator, "VULKAN_SDK") catch null) |sdk_path| {
                 defer b.allocator.free(sdk_path);
                 if (std.fs.path.join(b.allocator, &.{ sdk_path, "Lib" }) catch null) |ld| {
@@ -22,40 +21,31 @@ fn linkVulkanLoader(
             }
             exe.linkSystemLibrary("vulkan-1");
         },
-        .linux, .macos => {
-            exe.linkSystemLibrary("vulkan");
-        },
+        .linux, .macos => exe.linkSystemLibrary("vulkan"),
         else => {},
     }
 }
 
 //
 // ──────────────────────────────────────────────────────────────────────────────
-// Registry fetchers (download to ./registry if missing)
+// Registry helpers (download to ./registry if missing)
 // ──────────────────────────────────────────────────────────────────────────────
 //
 fn ensureVkRegistry(b: *std.Build) std.Build.LazyPath {
-    const xml_rel = "registry/vk.xml";
-    const registry_dir = "registry";
-    const cwd = std.fs.cwd();
-
-    if (cwd.openFile(xml_rel, .{})) |f| {
+    const rel = "registry/vk.xml";
+    if (std.fs.cwd().openFile(rel, .{})) |f| {
         f.close();
-        return b.path(xml_rel);
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => {
-            std.debug.print("error: failed to open {s}: {s}\n", .{ xml_rel, @errorName(err) });
+        return b.path(rel);
+    } else |err| {
+        if (err != error.FileNotFound) {
+            std.debug.print("error: open {s}: {s}\n", .{ rel, @errorName(err) });
             @panic("cannot access registry/vk.xml");
-        },
+        }
     }
 
-    cwd.makeDir(registry_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => {
-            std.debug.print("error: failed to create '{s}': {s}\n", .{ registry_dir, @errorName(err) });
-            @panic("cannot create registry directory");
-        },
+    std.fs.cwd().makeDir("registry") catch |e| if (e != error.PathAlreadyExists) {
+        std.debug.print("error: mkdir registry: {s}\n", .{@errorName(e)});
+        @panic("cannot create registry dir");
     };
 
     var argv = [_][]const u8{
@@ -63,199 +53,175 @@ fn ensureVkRegistry(b: *std.Build) std.Build.LazyPath {
         "-L",
         "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Docs/main/xml/vk.xml",
         "-o",
-        xml_rel,
+        rel,
     };
-
     var child = std.process.Child.init(&argv, b.allocator);
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
-
     const term = child.spawnAndWait() catch |e| {
-        std.debug.print("error: curl vk.xml spawn failed: {s}\n", .{@errorName(e)});
+        std.debug.print("error: curl vk.xml: {s}\n", .{@errorName(e)});
         @panic("curl not available");
     };
-
     switch (term) {
         .Exited => |code| if (code != 0) {
-            std.debug.print("error: curl (vk.xml) exited with code {d}\n", .{code});
+            std.debug.print("error: curl vk.xml exit {d}\n", .{code});
             @panic("failed to download vk.xml");
         },
         else => {
-            std.debug.print("error: curl (vk.xml) abnormal term: {any}\n", .{term});
+            std.debug.print("error: curl vk.xml abnormal: {any}\n", .{term});
             @panic("failed to download vk.xml");
         },
     }
-
-    if (cwd.openFile(xml_rel, .{})) |f2| f2.close() else |e| {
-        std.debug.print("error: vk.xml missing after download: {s}\n", .{@errorName(e)});
-        @panic("vk.xml missing after download");
-    }
-    return b.path(xml_rel);
+    return b.path(rel);
 }
 
 fn ensureXrRegistry(b: *std.Build) std.Build.LazyPath {
-    const cwd = std.fs.cwd();
-    const registry_dir = "registry";
-    const xml_rel = "registry/xr.xml";
-
-    if (std.process.getEnvVarOwned(b.allocator, "VRGAME_XR_XML") catch null) |env_path| {
-        defer b.allocator.free(env_path);
-        const open_result = if (std.fs.path.isAbsolute(env_path))
-            std.fs.openFileAbsolute(env_path, .{})
+    const rel = "registry/xr.xml";
+    if (std.process.getEnvVarOwned(b.allocator, "VRGAME_XR_XML") catch null) |envp| {
+        defer b.allocator.free(envp);
+        const open_res = if (std.fs.path.isAbsolute(envp))
+            std.fs.openFileAbsolute(envp, .{})
         else
-            cwd.openFile(env_path, .{});
-        if (open_result) |f| {
+            std.fs.cwd().openFile(envp, .{});
+        if (open_res) |f| {
             f.close();
-            std.log.info("Using xr.xml from VRGAME_XR_XML={s}", .{env_path});
-            return b.path(env_path);
+            std.log.info("Using xr.xml from VRGAME_XR_XML={s}", .{envp});
+            return b.path(envp);
         } else |e| {
-            std.log.warn("VRGAME_XR_XML={s} but failed to open: {s}", .{ env_path, @errorName(e) });
+            std.log.warn("VRGAME_XR_XML={s} open failed: {s}", .{ envp, @errorName(e) });
         }
     }
 
-    if (cwd.openFile(xml_rel, .{})) |f| {
+    if (std.fs.cwd().openFile(rel, .{})) |f| {
         f.close();
-        std.log.info("Using existing xr.xml at {s}", .{xml_rel});
-        return b.path(xml_rel);
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => {
-            std.debug.print("error: failed to open {s}: {s}\n", .{ xml_rel, @errorName(err) });
+        std.log.info("Using existing xr.xml at {s}", .{rel});
+        return b.path(rel);
+    } else |err| {
+        if (err != error.FileNotFound) {
+            std.debug.print("error: open {s}: {s}\n", .{ rel, @errorName(err) });
             @panic("cannot access registry/xr.xml");
-        },
+        }
     }
 
-    cwd.makeDir(registry_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => {
-            std.debug.print("error: failed to create '{s}': {s}\n", .{ registry_dir, @errorName(err) });
-            @panic("cannot create registry directory");
-        },
+    std.fs.cwd().makeDir("registry") catch |e| if (e != error.PathAlreadyExists) {
+        std.debug.print("error: mkdir registry: {s}\n", .{@errorName(e)});
+        @panic("cannot create registry dir");
     };
 
-    std.log.info("Downloading xr.xml into {s}", .{xml_rel});
+    std.log.info("Downloading xr.xml into {s}", .{rel});
     var argv = [_][]const u8{
         "curl",
         "-L",
         "https://raw.githubusercontent.com/zigadel/openxr-zig/ef4d73159ea71eaf496a83dd108e719e54831b8d/examples/xr.xml",
         "-o",
-        xml_rel,
+        rel,
     };
-
     var child = std.process.Child.init(&argv, b.allocator);
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
-
     const term = child.spawnAndWait() catch |e| {
-        std.debug.print("error: curl xr.xml spawn failed: {s}\n", .{@errorName(e)});
+        std.debug.print("error: curl xr.xml: {s}\n", .{@errorName(e)});
         @panic("curl not available");
     };
-
     switch (term) {
         .Exited => |code| if (code != 0) {
-            std.debug.print(
-                "error: curl (xr.xml) exited with code {d}\n" ++
-                    "hint: manually fetch and save as ./registry/xr.xml if needed\n",
-                .{code},
-            );
+            std.debug.print("error: curl xr.xml exit {d}\n", .{code});
             @panic("failed to download xr.xml");
         },
         else => {
-            std.debug.print("error: curl (xr.xml) abnormal term: {any}\n", .{term});
+            std.debug.print("error: curl xr.xml abnormal: {any}\n", .{term});
             @panic("failed to download xr.xml");
         },
     }
-
-    if (cwd.openFile(xml_rel, .{})) |f2| f2.close() else |e| {
-        std.debug.print("error: xr.xml missing after download: {s}\n", .{@errorName(e)});
-        @panic("xr.xml missing after download");
-    }
-    std.log.info("Successfully downloaded xr.xml into {s}", .{xml_rel});
-    return b.path(xml_rel);
+    return b.path(rel);
 }
 
 //
 // ──────────────────────────────────────────────────────────────────────────────
-// Shader build (GLSL → SPIR-V) into zig-out/bin/shaders
+// Small util: does a relative file exist?
+// ──────────────────────────────────────────────────────────────────────────────
+//
+fn fileExists(rel: []const u8) bool {
+    _ = std.fs.cwd().access(rel, .{}) catch return false;
+    return true;
+}
+
+//
+// ──────────────────────────────────────────────────────────────────────────────
+// Shader build/stage: put SPIR-V into zig-out/bin/shaders
 // ──────────────────────────────────────────────────────────────────────────────
 //
 fn addShaderBuildSteps(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
-    is_macos: bool,
 ) *std.Build.Step {
-    var glslc_path: ?[]const u8 = null;
-    if (b.findProgram(&.{"glslc"}, &.{}) catch null) |p| {
-        glslc_path = p;
-        std.log.info("Using glslc in PATH at {s}", .{p});
-    } else if (std.process.getEnvVarOwned(b.allocator, "VULKAN_SDK") catch null) |sdk| {
-        defer b.allocator.free(sdk);
-        const exe_name = if (@import("builtin").os.tag == .windows) "glslc.exe" else "glslc";
-        if (std.fs.path.join(b.allocator, &.{ sdk, "Bin", exe_name }) catch null) |candidate| {
-            defer b.allocator.free(candidate);
-            if (b.findProgram(&.{candidate}, &.{}) catch null) |p2| {
-                glslc_path = p2;
-                std.log.info("Using glslc from VULKAN_SDK at {s}", .{p2});
-            }
-        }
+    // Try to locate glslc; if absent we’ll just stage prebuilt .spv files.
+    const glslc: ?[]const u8 = b.findProgram(&.{"glslc"}, &.{}) catch null;
+    if (glslc) |p| {
+        std.log.info("Using glslc at {s}", .{p});
+    } else {
+        std.log.warn("glslc not found; will only stage existing .spv files from assets/shaders", .{});
     }
 
     const shaders_step = b.step("shaders", "Build or stage SPIR-V into zig-out/bin/shaders");
 
-    if (glslc_path) |gl_found| {
-        const mk = struct {
-            fn compileOne(
-                builder: *std.Build,
-                gl_path: []const u8,
-                mac: bool,
-                comptime stage_name: []const u8, // "vert" or "frag" (must be comptime)
-                src_rel: []const u8, // e.g. "shaders/basic_lit.vert"
-                out_name: []const u8, // e.g. "basic_lit.vert.spv"
-                dest_rel: []const u8, // e.g. "shaders/basic_lit.vert.spv"
-            ) struct {
-                cmd: *std.Build.Step.Run,
-                out: std.Build.LazyPath,
-                inst: *std.Build.Step.InstallFile,
-            } {
-                // Build the one-token flag at comptime
-                var cmd = builder.addSystemCommand(&.{ gl_path, "-O", "-c", "-fshader-stage=" ++ stage_name });
+    // Source directory and shader list (add more pairs as needed).
+    const SRC_DIR = "assets/shaders";
+    const items = [_][2][]const u8{
+        .{ "basic_lit.vert", "vert" },
+        .{ "basic_lit.frag", "frag" },
+        .{ "triangle.vert", "vert" },
+        .{ "triangle.frag", "frag" },
+    };
 
-                // Platform-specific UBO binding (macOS needs binding=1 to avoid Metal buffer(0) conflict)
-                if (mac) {
-                    cmd.addArg("-DUBO_BINDING=1");
-                } else {
-                    cmd.addArg("-DUBO_BINDING=0");
-                }
+    // Build rule per shader:
+    // - If glslc exists AND GLSL source exists → compile to .spv and install.
+    // - Else if prebuilt .spv exists in assets/shaders → just install it.
+    // - Else warn (missing shader).
+    for (items) |pair| {
+        const stem = pair[0]; // e.g. "basic_lit.vert"
+        const stage = pair[1]; // "vert" or "frag"
 
-                // Track the GLSL file contents so edits trigger rebuilds
-                const src_lp = builder.path(src_rel);
-                cmd.addFileArg(src_lp);
+        const src_glsl_rel = b.fmt("{s}/{s}", .{ SRC_DIR, stem }); // assets/shaders/basic_lit.vert
+        const src_spv_rel = b.fmt("{s}/{s}.spv", .{ SRC_DIR, stem }); // assets/shaders/basic_lit.vert.spv
+        const out_spv_name = b.fmt("{s}.spv", .{stem}); // basic_lit.vert.spv
+        const install_dest = b.fmt("shaders/{s}", .{out_spv_name}); // shaders/basic_lit.vert.spv
 
-                cmd.addArg("-o");
-                const out_lp = cmd.addOutputFileArg(out_name);
+        if (glslc != null and fileExists(src_glsl_rel)) {
+            var cmd = b.addSystemCommand(&.{ glslc.?, "-O", "-c", b.fmt("-fshader-stage={s}", .{stage}) });
 
-                const inst = builder.addInstallFileWithDir(out_lp, .bin, dest_rel);
-                return .{ .cmd = cmd, .out = out_lp, .inst = inst };
-            }
-        };
+            // Descriptor bindings must match src/main.zig:
+            // set = 0, binding 0 → UBO, binding 1 → sampler
+            cmd.addArg("-DUBO_BINDING=0");
+            cmd.addArg("-DTEX_BINDING=1");
 
-        const tri_v = mk.compileOne(b, gl_found, is_macos, "vert", "shaders/triangle.vert", "triangle.vert.spv", "shaders/triangle.vert.spv");
-        const tri_f = mk.compileOne(b, gl_found, is_macos, "frag", "shaders/triangle.frag", "triangle.frag.spv", "shaders/triangle.frag.spv");
-        const bl_v = mk.compileOne(b, gl_found, is_macos, "vert", "shaders/basic_lit.vert", "basic_lit.vert.spv", "shaders/basic_lit.vert.spv");
-        const bl_f = mk.compileOne(b, gl_found, is_macos, "frag", "shaders/basic_lit.frag", "basic_lit.frag.spv", "shaders/basic_lit.frag.spv");
+            cmd.addFileArg(b.path(src_glsl_rel));
+            cmd.addArg("-o");
+            const out_lp = cmd.addOutputFileArg(out_spv_name);
 
-        inline for ([_]@TypeOf(tri_v){ tri_v, tri_f, bl_v, bl_f }) |x| {
-            shaders_step.dependOn(&x.cmd.step);
-            shaders_step.dependOn(&x.inst.step);
+            const inst = b.addInstallFileWithDir(out_lp, .bin, install_dest);
+            shaders_step.dependOn(&cmd.step);
+            shaders_step.dependOn(&inst.step);
+        } else if (fileExists(src_spv_rel)) {
+            const inst2 = b.addInstallFileWithDir(b.path(src_spv_rel), .bin, install_dest);
+            shaders_step.dependOn(&inst2.step);
+        } else {
+            std.log.warn("Shader missing: {s} (no {s} or {s})", .{ stem, src_glsl_rel, src_spv_rel });
         }
     }
 
+    // Ensure the executable won’t run before shaders are present.
     exe.step.dependOn(shaders_step);
     return shaders_step;
 }
 
+//
+// ──────────────────────────────────────────────────────────────────────────────
+// Test helper
+// ──────────────────────────────────────────────────────────────────────────────
+//
 fn addTestRun(b: *std.Build, root_mod: *std.Build.Module) *std.Build.Step.Run {
     const t = b.addTest(.{ .root_module = root_mod });
     return b.addRunArtifact(t);
@@ -270,20 +236,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Registries (download into workspace if missing).
     const vk_registry = ensureVkRegistry(b);
     const xr_registry = ensureXrRegistry(b);
 
-    // ── External dependencies ─────────────────────────────────────────────
+    // ── External deps
     const glfw_dep = b.dependency("glfw_zig", .{ .target = target, .optimize = optimize });
     const glfw_mod = glfw_dep.module("glfw");
     const glfw_lib = glfw_dep.artifact("glfw-zig");
 
-    const vk_dep = b.dependency("vulkan", .{
-        .target = target,
-        .optimize = optimize,
-        .registry = vk_registry,
-    });
+    const vk_dep = b.dependency("vulkan", .{ .target = target, .optimize = optimize, .registry = vk_registry });
     const vk_mod = vk_dep.module("vulkan-zig");
 
     const xr_dep = b.dependency("openxr", .{ .target = target, .optimize = optimize });
@@ -292,12 +253,12 @@ pub fn build(b: *std.Build) void {
     xr_gen_cmd.addFileArg(xr_registry);
     const xr_zig = xr_gen_cmd.addOutputFileArg("xr.zig");
     const xr_mod = b.createModule(.{
-        .root_source_file = xr_zig, // lazy path from the generator
+        .root_source_file = xr_zig,
         .target = target,
         .optimize = optimize,
     });
 
-    // ── Project modules (no relative @imports; everything wired here) ─────
+    // ── Project modules
     const math3d_mod = b.createModule(.{
         .root_source_file = b.path("src/math/math3d.zig"),
         .target = target,
@@ -344,6 +305,21 @@ pub fn build(b: *std.Build) void {
     });
     camera3d_mod.addImport("math3d", math3d_mod);
 
+    const texture_mod = b.createModule(.{
+        .root_source_file = b.path("src/graphics/texture.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    texture_mod.addImport("vulkan", vk_mod);
+    texture_mod.addImport("graphics_context", graphics_context_mod);
+
+    const depth_mod = b.createModule(.{
+        .root_source_file = b.path("src/graphics/depth.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    depth_mod.addImport("vulkan", vk_mod);
+
     const vrgame_root = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -356,7 +332,7 @@ pub fn build(b: *std.Build) void {
     vrgame_root.addImport("math3d", math3d_mod);
     vrgame_root.addImport("camera3d", camera3d_mod);
 
-    // ── Executable ────────────────────────────────────────────────────────
+    // ── Executable
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -372,25 +348,26 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("vrgame", vrgame_root);
     exe_mod.addImport("math3d", math3d_mod);
     exe_mod.addImport("camera3d", camera3d_mod);
+    exe_mod.addImport("depth", depth_mod);
+    exe_mod.addImport("texture", texture_mod);
 
     const exe = b.addExecutable(.{
         .name = "vrgame",
         .root_module = exe_mod,
     });
 
-    // OpenXR codegen before anything that imports xr_mod.
+    // OpenXR generator
     exe.step.dependOn(&xr_gen_cmd.step);
 
-    // GLFW + Vulkan loader
+    // GLFW + Vulkan
     exe.linkLibrary(glfw_lib);
     linkVulkanLoader(exe, target, b);
 
     // Install exe
     b.installArtifact(exe);
 
-    // Shaders → zig-out/bin/shaders (pass UBO_BINDING macro per-OS)
-    const is_macos = (target.result.os.tag == .macos);
-    const shaders_step = addShaderBuildSteps(b, exe, is_macos);
+    // Shaders (compile if sources exist; else stage precompiled .spv)
+    const shaders_step = addShaderBuildSteps(b, exe);
 
     // Run
     const run_cmd = b.addRunArtifact(exe);
@@ -401,12 +378,11 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run vrgame");
     run_step.dependOn(&run_cmd.step);
 
-    // ── Tests (ZTable-style: unit in files, integration/e2e in /tests) ────
+    // ── Tests
     const unit_step = b.step("test-unit", "Run unit tests (modules)");
     const integration_step = b.step("test-integration", "Run integration tests");
     const e2e_step = b.step("test-e2e", "Run end-to-end tests");
 
-    // Unit tests per module
     const run_main_tests = addTestRun(b, exe_mod);
     const run_graphics_context_tests = addTestRun(b, graphics_context_mod);
     const run_swapchain_tests = addTestRun(b, swapchain_mod);
@@ -439,7 +415,7 @@ pub fn build(b: *std.Build) void {
     unit_step.dependOn(&run_math3d_tests.step);
     unit_step.dependOn(&run_camera3d_tests.step);
 
-    // Integration tests
+    // Integration tests (optional)
     const have_integration = blk: {
         _ = std.fs.cwd().statFile("tests/test_all_integration.zig") catch break :blk false;
         break :blk true;
@@ -469,10 +445,10 @@ pub fn build(b: *std.Build) void {
         integration_step.dependOn(&run_integration.step);
     }
 
-    // E2E tests
-    const have_e2e = blk: {
-        _ = std.fs.cwd().statFile("tests/test_all_e2e.zig") catch break :blk false;
-        break :blk true;
+    // E2E tests (optional)
+    const have_e2e = blk2: {
+        _ = std.fs.cwd().statFile("tests/test_all_e2e.zig") catch break :blk2 false;
+        break :blk2 true;
     };
     if (have_e2e) {
         const e2e_mod = b.createModule(.{
@@ -499,7 +475,7 @@ pub fn build(b: *std.Build) void {
         e2e_step.dependOn(&run_e2e.step);
     }
 
-    // Aggregate test steps + default
+    // Aggregate
     const test_all_step = b.step("test-all", "Build vrgame + run unit, integration, and e2e tests");
     test_all_step.dependOn(b.getInstallStep());
     test_all_step.dependOn(unit_step);
