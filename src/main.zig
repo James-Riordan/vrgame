@@ -27,18 +27,19 @@ const Orbit = @import("orbit");
 const Allocator = std.mem.Allocator;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Platform / graphics toggles (kept minimal and explicit)
+// Platform / graphics toggles
 const IS_MAC = builtin.os.tag == .macos;
 
-// Vulkan Y handling:
-// - Win/Linux: flip in the viewport (negative height), no projection flip.
-// - macOS/MoltenVK: no flip at all.
-const VIEWPORT_Y_FLIP: bool = !IS_MAC;
+// Robust cross-platform rule:
+//   • Always flip Y in the *viewport* (negative height).
+//   • Do NOT flip the projection.
+// This matches Vulkan clip space on Win/Linux and MoltenVK on macOS.
+const VIEWPORT_Y_FLIP: bool = true;
 const PROJECTION_Y_FLIP: bool = false;
 
 // Optional debug toggles
-const FORCE_DEBUG_FLAT_SHADERS: bool = false; // draw pink flat output if true
-const DEBUG_DISABLE_DEPTH: bool = false; // disable depth test/writes
+const FORCE_DEBUG_FLAT_SHADERS: bool = false;
+const DEBUG_DISABLE_DEPTH: bool = false;
 
 const VK_FALSE32: vk.Bool32 = @enumFromInt(vk.FALSE);
 const VK_TRUE32: vk.Bool32 = @enumFromInt(vk.TRUE);
@@ -135,7 +136,6 @@ const ConfigFile = struct {
     look_smooth_halflife_ms: ?f32 = null,
     look_expo: ?f32 = null,
     max_pitch_deg: ?f32 = null,
-    // NEW: allow string in config.json, e.g. "blender_orbit" or "fly"
     camera_style: ?[]const u8 = null,
 };
 
@@ -247,12 +247,9 @@ const ScrollCB = ?*const fn (?*glfw.Window, f64, f64) callconv(.c) void;
 var prev_scroll_cb: ScrollCB = null;
 
 fn installScroll(window: *glfw.Window) void {
-    // Store whatever was registered before (may be null) and install ours.
     prev_scroll_cb = glfw.setScrollCallback(window, onScroll);
 }
-
 fn restoreScroll(window: *glfw.Window) void {
-    // Put back the previous callback on shutdown or handoff.
     _ = glfw.setScrollCallback(window, prev_scroll_cb);
 }
 
@@ -282,18 +279,27 @@ fn mulPoint4x4(m: [16]f32, p: [4]f32) [4]f32 {
     return .{
         m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12] * p[3],
         m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13] * p[3],
-        m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14] * p[3],
+        m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[15] * p[3],
         m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15] * p[3],
     };
 }
 
 fn centerInsideClip(vp: [16]f32, world_center: [3]f32) bool {
+    // Homogeneous clip coords
     const c = mulPoint4x4(vp, .{ world_center[0], world_center[1], world_center[2], 1.0 });
+
+    // Behind the camera → culled
     if (c[3] <= 0.0) return false;
+
+    // Vulkan clip space: x,y ∈ [-w, +w], z ∈ [0, +w]
     const ax = @abs(c[0]);
     const ay = @abs(c[1]);
-    const az = @abs(c[2]);
-    return (ax <= c[3] and ay <= c[3] and az <= c[3]);
+    // small pad reduces edge popping when the center is near the frustum planes
+    const pad: f32 = 1.02;
+
+    return (ax <= c[3] * pad) and
+        (ay <= c[3] * pad) and
+        (c[2] >= 0.0) and (c[2] <= c[3] * pad);
 }
 
 fn axisAngleMat4(axis_in: [3]f32, angle: f32, translate: [3]f32) [16]f32 {
@@ -961,7 +967,7 @@ fn createPipeline(gc: *const GraphicsContext, layout: vk.PipelineLayout, render_
     const ia = vk.PipelineInputAssemblyStateCreateInfo{ .flags = .{}, .topology = .triangle_list, .primitive_restart_enable = VK_FALSE32 };
     const vp = vk.PipelineViewportStateCreateInfo{ .flags = .{}, .viewport_count = 1, .p_viewports = undefined, .scissor_count = 1, .p_scissors = undefined };
 
-    // NOTE: with negative viewport height we usually use .clockwise for "front"
+    // With negative viewport height we use .clockwise for "front"
     const front_face_mode: vk.FrontFace = if (VIEWPORT_Y_FLIP) .clockwise else .counter_clockwise;
 
     const rs = vk.PipelineRasterizationStateCreateInfo{
@@ -969,7 +975,7 @@ fn createPipeline(gc: *const GraphicsContext, layout: vk.PipelineLayout, render_
         .depth_clamp_enable = VK_FALSE32,
         .rasterizer_discard_enable = VK_FALSE32,
         .polygon_mode = .fill,
-        .cull_mode = .{}, // keep disabled for safety while iterating
+        .cull_mode = .{}, // disabled while iterating
         .front_face = front_face_mode,
         .depth_bias_enable = VK_FALSE32,
         .depth_bias_constant_factor = 0,
@@ -1281,9 +1287,10 @@ pub fn main() !void {
     });
     defer depth_res.destroy(gc.vkd, gc.dev, null);
 
-    // Descriptor set layout (set=0). Keep binding numbers explicit.
-    const ubo_binding_index: u32 = if (IS_MAC) 1 else 0;
-    const sampler_binding_index: u32 = if (IS_MAC) 0 else 1;
+    // Descriptor set layout (set=0). Bindings must match build defines:
+    // UBO_BINDING=0, TEX_BINDING=1 (see build.zig glslc args).
+    const ubo_binding_index: u32 = 0;
+    const sampler_binding_index: u32 = 1;
 
     const ubo_binding = vk.DescriptorSetLayoutBinding{
         .binding = ubo_binding_index,
@@ -1652,7 +1659,7 @@ pub fn main() !void {
             }
         }
 
-        // Update fly camera from WASD/mouse (your existing path)
+        // Update fly camera from WASD/mouse
         camera.update(move_dt, cin);
 
         // Build Scene UBO for THIS image
@@ -1767,7 +1774,6 @@ pub fn main() !void {
             if (extent.width > 0 and extent.height > 0) {
                 swapchain.recreate(extent) catch |e| switch (e) {
                     error.InvalidSurfaceDimensions => {
-                        // Window is minimized or reported 0×0; try again next frame.
                         glfw.pollEvents();
                         continue;
                     },
