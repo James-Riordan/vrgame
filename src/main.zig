@@ -21,6 +21,9 @@ const math3d = @import("math3d");
 const Vec3 = math3d.Vec3;
 const Mat4 = math3d.Mat4;
 
+const Orbit = @import("orbit");
+// REMOVED: const MouseScroll = @import("mouse_scroll").Scroll;
+
 const Allocator = std.mem.Allocator;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -35,7 +38,7 @@ const PROJECTION_Y_FLIP: bool = false;
 
 // Optional debug toggles
 const FORCE_DEBUG_FLAT_SHADERS: bool = false; // draw pink flat output if true
-const DEBUG_DISABLE_DEPTH: bool = false;      // disable depth test/writes
+const DEBUG_DISABLE_DEPTH: bool = false; // disable depth test/writes
 
 const VK_FALSE32: vk.Bool32 = @enumFromInt(vk.FALSE);
 const VK_TRUE32: vk.Bool32 = @enumFromInt(vk.TRUE);
@@ -70,12 +73,14 @@ var inst_color: [CUBE_INSTANCES][4]f32 = undefined;
 // Scene UBO
 const SceneUBO = extern struct {
     vp: [16]f32,
-    light_dir: [4]f32,   // xyz
+    light_dir: [4]f32, // xyz
     light_color: [4]f32, // rgb
-    ambient: [4]f32,     // rgb
+    ambient: [4]f32, // rgb
     time: f32,
     _pad: [3]f32 = .{ 0, 0, 0 },
 };
+
+const CameraStyle = enum { fly, blender_orbit };
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Runtime config (simple, only what we actually use)
@@ -103,6 +108,16 @@ const Config = struct {
     look_smooth_halflife_ms: f32 = 60.0,
     look_expo: f32 = 0.15,
     max_pitch_deg: f32 = 89.0,
+    camera_style: CameraStyle = .blender_orbit,
+
+    // Blender-like orbit tuning
+    orbit_yaw_sens: f32 = 0.008, // rad per px (horizontal)
+    orbit_pitch_sens: f32 = 0.008, // rad per px (vertical)
+    orbit_pan_sens: f32 = 1.0, // world-units per px @ radius=1
+    orbit_dolly_wheel: f32 = 1.20, // wheel zoom factor per notch (>1)
+    orbit_dolly_drag: f32 = 0.003, // Ctrl+RMB vertical drag factor
+    orbit_min_radius: f32 = 0.15,
+    orbit_max_radius: f32 = 500.0,
 };
 
 const ConfigFile = struct {
@@ -120,6 +135,8 @@ const ConfigFile = struct {
     look_smooth_halflife_ms: ?f32 = null,
     look_expo: ?f32 = null,
     max_pitch_deg: ?f32 = null,
+    // NEW: allow string in config.json, e.g. "blender_orbit" or "fly"
+    camera_style: ?[]const u8 = null,
 };
 
 var CONFIG: Config = .{};
@@ -127,7 +144,7 @@ var CONFIG: Config = .{};
 // ──────────────────────────────────────────────────────────────────────────────
 // Static state for small input helpers
 const InputState = struct {
-    var just_locked: bool = false;       // set for one frame after cursor lock
+    var just_locked: bool = false; // set for one frame after cursor lock
     var raw_mouse_enabled: bool = false; // once enabled, stays true
     var raw_mouse_checked: bool = false; // check & enable only once
 };
@@ -151,8 +168,97 @@ const LookState = struct {
     pub var filt_dy: f32 = 0.0;
 };
 
+fn normalize3(v: [3]f32) [3]f32 {
+    const s = std.math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (s <= 0.0) return .{ 0, 0, 0 };
+    return .{ v[0] / s, v[1] / s, v[2] / s };
+}
+fn sub3(a: [3]f32, b: [3]f32) [3]f32 {
+    return .{ a[0] - b[0], a[1] - b[1], a[2] - b[2] };
+}
+fn add3(a: [3]f32, b: [3]f32) [3]f32 {
+    return .{ a[0] + b[0], a[1] + b[1], a[2] + b[2] };
+}
+fn scale3(a: [3]f32, s: f32) [3]f32 {
+    return .{ a[0] * s, a[1] * s, a[2] * s };
+}
+fn dot3(a: [3]f32, b: [3]f32) f32 {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+fn cross3(a: [3]f32, b: [3]f32) [3]f32 {
+    return .{ a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0] };
+}
+
+fn mul4x4(a: [16]f32, b: [16]f32) [16]f32 {
+    var r: [16]f32 = undefined;
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        var j: usize = 0;
+        while (j < 4) : (j += 1) {
+            r[i + 4 * j] =
+                a[0 + 4 * j] * b[i + 0] +
+                a[1 + 4 * j] * b[i + 4] +
+                a[2 + 4 * j] * b[i + 8] +
+                a[3 + 4 * j] * b[i + 12];
+        }
+    }
+    return r;
+}
+
+fn perspectiveRH_ZO(fov: f32, aspect: f32, zn: f32, zf: f32) [16]f32 {
+    const f = 1.0 / std.math.tan(fov * 0.5);
+    return .{
+        f / aspect, 0, 0,                     0,
+        0,          f, 0,                     0,
+        0,          0, zf / (zn - zf),        -1,
+        0,          0, (zf * zn) / (zn - zf), 0,
+    };
+}
+
+fn lookAtRH(eye: [3]f32, target: [3]f32, up_world: [3]f32) [16]f32 {
+    const fwd = normalize3(sub3(target, eye));
+    const right = normalize3(cross3(fwd, up_world));
+    const up = cross3(right, fwd);
+    return .{
+        right[0],          up[0],          -fwd[0],        0,
+        right[1],          up[1],          -fwd[1],        0,
+        right[2],          up[2],          -fwd[2],        0,
+        -dot3(right, eye), -dot3(up, eye), dot3(fwd, eye), 1,
+    };
+}
+
+const OrbitState = struct {
+    target: [3]f32 = .{ 0.0, 0.5, 0.0 },
+    radius: f32 = 6.0,
+    yaw: f32 = 0.0, // radians
+    pitch: f32 = -0.15, // radians
+};
+
+// Local scroll accumulator to avoid separate module dependency.
+const Scroll = struct {
+    pub var dy: f64 = 0.0;
+};
+fn onScroll(_: ?*glfw.Window, _: f64, yoff: f64) callconv(.c) void {
+    Scroll.dy += yoff;
+}
+
+// Keep/restore previous GLFW scroll callback (safer for long-term composability)
+const ScrollCB = ?*const fn (?*glfw.Window, f64, f64) callconv(.c) void;
+var prev_scroll_cb: ScrollCB = null;
+
+fn installScroll(window: *glfw.Window) void {
+    // Store whatever was registered before (may be null) and install ours.
+    prev_scroll_cb = glfw.setScrollCallback(window, onScroll);
+}
+
+fn restoreScroll(window: *glfw.Window) void {
+    // Put back the previous callback on shutdown or handoff.
+    _ = glfw.setScrollCallback(window, prev_scroll_cb);
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Small math helpers
+
 inline fn clamp01(x: f32) f32 {
     if (x < 0.0) return 0.0;
     if (x > 1.0) return 1.0;
@@ -194,7 +300,9 @@ fn axisAngleMat4(axis_in: [3]f32, angle: f32, translate: [3]f32) [16]f32 {
     var ax = axis_in;
     const len = std.math.sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
     if (len > 0.0) {
-        ax[0] /= len; ax[1] /= len; ax[2] /= len;
+        ax[0] /= len;
+        ax[1] /= len;
+        ax[2] /= len;
     } else {
         ax = .{ 0, 1, 0 };
     }
@@ -613,6 +721,20 @@ fn readAllAllocFromDir(alloc: Allocator, dir: std.fs.Dir, sub_path: []const u8, 
     return buf;
 }
 
+fn parseCameraStyle(s: []const u8) ?CameraStyle {
+    if (std.ascii.eqlIgnoreCase(s, "fly") or std.ascii.eqlIgnoreCase(s, "fps") or std.ascii.eqlIgnoreCase(s, "free")) {
+        return .fly;
+    }
+    if (std.ascii.eqlIgnoreCase(s, "orbit") or
+        std.ascii.eqlIgnoreCase(s, "blender") or
+        std.ascii.eqlIgnoreCase(s, "blender_orbit") or
+        std.ascii.eqlIgnoreCase(s, "design"))
+    {
+        return .blender_orbit;
+    }
+    return null;
+}
+
 fn overlayConfig(base: Config, file: ConfigFile) Config {
     var out = base;
     if (file.fov_deg) |v| out.fov_deg = v;
@@ -629,6 +751,11 @@ fn overlayConfig(base: Config, file: ConfigFile) Config {
     if (file.look_smooth_halflife_ms) |v| out.look_smooth_halflife_ms = v;
     if (file.look_expo) |v| out.look_expo = v;
     if (file.max_pitch_deg) |v| out.max_pitch_deg = v;
+    if (file.camera_style) |s| {
+        if (parseCameraStyle(s)) |mode| {
+            out.camera_style = mode;
+        }
+    }
     return out;
 }
 
@@ -719,10 +846,16 @@ fn loadSpirvFrom(alloc: Allocator, abs: []const u8) ![]u8 {
 // Build "roots" without mismatched array types. Returns slice backed by caller.
 fn buildAssetRoots(out: *[4][]const u8, exe_dir: []const u8, assets_from_exe: ?[]const u8) []const []const u8 {
     var n: usize = 0;
-    out[n] = exe_dir; n += 1;
-    if (assets_from_exe) |p| { out[n] = p; n += 1; }
-    out[n] = "."; n += 1;
-    out[n] = "assets"; n += 1;
+    out[n] = exe_dir;
+    n += 1;
+    if (assets_from_exe) |p| {
+        out[n] = p;
+        n += 1;
+    }
+    out[n] = ".";
+    n += 1;
+    out[n] = "assets";
+    n += 1;
     return out[0..n];
 }
 
@@ -802,7 +935,7 @@ fn createPipeline(gc: *const GraphicsContext, layout: vk.PipelineLayout, render_
 
     const bindings = [_]vk.VertexInputBindingDescription{
         Vertex.binding_description, // binding 0
-        instance_binding,           // binding 1
+        instance_binding, // binding 1
     };
 
     const a_v0 = Vertex.attribute_description[0];
@@ -811,13 +944,10 @@ fn createPipeline(gc: *const GraphicsContext, layout: vk.PipelineLayout, render_
 
     const attrs = [_]vk.VertexInputAttributeDescription{
         // per-vertex (binding 0)
-        a_v0, a_v1, a_v2,
+        a_v0,                                                                           a_v1,                                                                                                               a_v2,
         // per-instance (binding 1): four vec4s for model, then one vec4 for color
-        .{ .location = 3, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = 0 },
-        .{ .location = 4, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = 16 },
-        .{ .location = 5, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = 32 },
-        .{ .location = 6, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = 48 },
-        .{ .location = 7, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = @intCast(@offsetOf(Instance, "color")) },
+        .{ .location = 3, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = 0 },  .{ .location = 4, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = 16 },                                     .{ .location = 5, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = 32 },
+        .{ .location = 6, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = 48 }, .{ .location = 7, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = @intCast(@offsetOf(Instance, "color")) },
     };
 
     const vi = vk.PipelineVertexInputStateCreateInfo{
@@ -1092,6 +1222,10 @@ pub fn main() !void {
 
     const window = try glfw.createWindow(@as(i32, @intCast(extent.width)), @as(i32, @intCast(extent.height)), window_title_cstr, null, null);
     defer glfw.destroyWindow(window);
+
+    // Install our scroll handler and ensure we restore whatever was there on exit
+    installScroll(window);
+    defer restoreScroll(window);
 
     {
         const pos = glfw.getWindowPos(window);
@@ -1412,6 +1546,9 @@ pub fn main() !void {
 
     var frame_timer = FrameTimer.init(nowMsFromGlfw(), 1000);
 
+    var orbit_enabled: bool = false;
+    var orbit: Orbit.OrbitState = .{};
+
     // Instance scatter (deterministic)
     scatterInstances(0xCAFEBABE1234_5678);
 
@@ -1445,6 +1582,33 @@ pub fn main() !void {
             scatterInstances(0xCAFEBABE1234_5678);
         }
 
+        // Orbit toggle with target pick
+        const okey = glfw.getKey(window, glfw.c.GLFW_KEY_O) == glfw.c.GLFW_PRESS;
+        const OToggle = struct {
+            var prev: bool = false;
+        };
+        if (okey and !OToggle.prev) {
+            orbit_enabled = !orbit_enabled;
+
+            if (orbit_enabled) {
+                var vptmp = camera.viewProjMatrix();
+                if (PROJECTION_Y_FLIP) vptmp.m[5] = -vptmp.m[5];
+                const cfg = Orbit.OrbitConfig{
+                    .yaw_sens = CONFIG.orbit_yaw_sens,
+                    .pitch_sens = CONFIG.orbit_pitch_sens,
+                    .dolly_wheel = CONFIG.orbit_dolly_wheel,
+                    .min_radius = CONFIG.orbit_min_radius,
+                    .max_radius = CONFIG.orbit_max_radius,
+                    .max_pitch_deg = CONFIG.max_pitch_deg,
+                };
+                orbit.pickTargetFromVP(vptmp.m, cfg);
+                std.log.info("Orbit: ON", .{});
+            } else {
+                std.log.info("Orbit: OFF", .{});
+            }
+        }
+        OToggle.prev = okey;
+
         // ── RMB edge latch (press → lock, release → unlock)
         const rmb_down = (glfw.getMouseButton(window, glfw.c.GLFW_MOUSE_BUTTON_RIGHT) == glfw.c.GLFW_PRESS);
         const became_down = rmb_down and !MouseLatch.rmb_was_down;
@@ -1465,7 +1629,7 @@ pub fn main() !void {
         if (became_down) {
             glfw.setInputMode(window, glfw.c.GLFW_CURSOR, glfw.c.GLFW_CURSOR_DISABLED);
             InputState.just_locked = true; // one frame only
-            LookState.have_prev = false;    // reset look filter
+            LookState.have_prev = false; // reset look filter
             LookState.filt_dx = 0;
             LookState.filt_dy = 0;
         }
@@ -1475,6 +1639,20 @@ pub fn main() !void {
 
         // Sample input (use raw_dt for smoothing/filters)
         const cin = sampleCameraInput(window, rmb_down, raw_dt);
+
+        // --- Wheel (zoom/dolly) ------------------------------------------------------
+        if (orbit_enabled) {
+            const wheel = @as(f32, @floatCast(Scroll.dy));
+            if (wheel != 0) {
+                // Scroll up (+) → zoom in (smaller radius). Using multiplicative dolly.
+                const factor = std.math.pow(f32, CONFIG.orbit_dolly_wheel, -wheel);
+                const r = orbit.radius * factor;
+                orbit.radius = @max(CONFIG.orbit_min_radius, @min(CONFIG.orbit_max_radius, r));
+                Scroll.dy = 0; // clear after consuming
+            }
+        }
+
+        // Update fly camera from WASD/mouse (your existing path)
         camera.update(move_dt, cin);
 
         // Build Scene UBO for THIS image
@@ -1651,7 +1829,7 @@ pub fn main() !void {
     try swapchain.waitForAllFences();
 }
 
-// ── Sanity test (at most one flip path)
+// ── Sanity test (at most one Y-flip path is enabled)
 test "at most one Y-flip path is enabled" {
     try std.testing.expect(!(VIEWPORT_Y_FLIP and PROJECTION_Y_FLIP));
 }

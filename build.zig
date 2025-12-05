@@ -176,18 +176,14 @@ fn addShaderBuildSteps(
         .{ "triangle.frag", "frag" },
     };
 
-    // Build rule per shader:
-    // - If glslc exists AND GLSL source exists → compile to .spv and install.
-    // - Else if prebuilt .spv exists in assets/shaders → just install it.
-    // - Else warn (missing shader).
     for (items) |pair| {
         const stem = pair[0]; // e.g. "basic_lit.vert"
         const stage = pair[1]; // "vert" or "frag"
 
-        const src_glsl_rel = b.fmt("{s}/{s}", .{ SRC_DIR, stem }); // assets/shaders/basic_lit.vert
-        const src_spv_rel = b.fmt("{s}/{s}.spv", .{ SRC_DIR, stem }); // assets/shaders/basic_lit.vert.spv
-        const out_spv_name = b.fmt("{s}.spv", .{stem}); // basic_lit.vert.spv
-        const install_dest = b.fmt("shaders/{s}", .{out_spv_name}); // shaders/basic_lit.vert.spv
+        const src_glsl_rel = b.fmt("{s}/{s}", .{ SRC_DIR, stem });
+        const src_spv_rel = b.fmt("{s}/{s}.spv", .{ SRC_DIR, stem });
+        const out_spv_name = b.fmt("{s}.spv", .{stem});
+        const install_dest = b.fmt("shaders/{s}", .{out_spv_name});
 
         if (glslc != null and fileExists(src_glsl_rel)) {
             var cmd = b.addSystemCommand(&.{ glslc.?, "-O", "-c", b.fmt("-fshader-stage={s}", .{stage}) });
@@ -320,6 +316,18 @@ pub fn build(b: *std.Build) void {
     });
     depth_mod.addImport("vulkan", vk_mod);
 
+    const scroll_mod = b.createModule(.{
+        .root_source_file = b.path("src/input/scroll.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const orbit_mod = b.createModule(.{
+        .root_source_file = b.path("src/game/orbit.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const vrgame_root = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -350,6 +358,8 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("camera3d", camera3d_mod);
     exe_mod.addImport("depth", depth_mod);
     exe_mod.addImport("texture", texture_mod);
+    exe_mod.addImport("mouse_scroll", scroll_mod);
+    exe_mod.addImport("orbit", orbit_mod);
 
     const exe = b.addExecutable(.{
         .name = "vrgame",
