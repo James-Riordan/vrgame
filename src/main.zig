@@ -22,7 +22,6 @@ const Vec3 = math3d.Vec3;
 const Mat4 = math3d.Mat4;
 
 const Orbit = @import("orbit");
-// REMOVED: const MouseScroll = @import("mouse_scroll").Scroll;
 
 const Allocator = std.mem.Allocator;
 
@@ -30,11 +29,19 @@ const Allocator = std.mem.Allocator;
 // Platform / graphics toggles
 const IS_MAC = builtin.os.tag == .macos;
 
-// Robust cross-platform rule:
-// - On macOS (MoltenVK): flip the PROJECTION, keep viewport normal.
-// - On Win/Linux Vulkan: flip the VIEWPORT (negative height), keep projection normal.
-const VIEWPORT_Y_FLIP: bool = !IS_MAC;
-const PROJECTION_Y_FLIP: bool = IS_MAC;
+// Flip policy:
+// - Windows/Linux: viewport flip (neg height), NO projection flip.
+// - macOS: projection flip, NO viewport flip.
+pub const VIEWPORT_Y_FLIP: bool = !IS_MAC; // Windows/Linux = true, macOS = false
+pub const PROJECTION_Y_FLIP: bool = IS_MAC; // macOS = true, Windows/Linux = false
+
+comptime {
+    if (IS_MAC) {
+        if (VIEWPORT_Y_FLIP or !PROJECTION_Y_FLIP) @compileError("macOS: projection flip only.");
+    } else {
+        if (!VIEWPORT_Y_FLIP or PROJECTION_Y_FLIP) @compileError("Windows/Linux: viewport flip only.");
+    }
+}
 
 // Optional debug toggles
 const FORCE_DEBUG_FLAT_SHADERS: bool = false;
@@ -120,24 +127,6 @@ const Config = struct {
     orbit_max_radius: f32 = 500.0,
 };
 
-const ConfigFile = struct {
-    fov_deg: ?f32 = null,
-    mouse_sens: ?f32 = null,
-    invert_y: ?bool = null,
-    enable_raw_mouse: ?bool = null,
-    base_move_speed_scale: ?f32 = null,
-    sprint_mult: ?f32 = null,
-    allow_alt_enter: ?bool = null,
-    allow_f11: ?bool = null,
-    allow_cmd_ctrl_f_mac: ?bool = null,
-    debug_heartbeat_every: ?u32 = null,
-    debug_no_draw: ?bool = null,
-    look_smooth_halflife_ms: ?f32 = null,
-    look_expo: ?f32 = null,
-    max_pitch_deg: ?f32 = null,
-    camera_style: ?[]const u8 = null,
-};
-
 var CONFIG: Config = .{};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -167,6 +156,8 @@ const LookState = struct {
     pub var filt_dy: f32 = 0.0;
 };
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Small math helpers
 fn normalize3(v: [3]f32) [3]f32 {
     const s = std.math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
     if (s <= 0.0) return .{ 0, 0, 0 };
@@ -233,7 +224,7 @@ const OrbitState = struct {
     pitch: f32 = -0.15, // radians
 };
 
-// Local scroll accumulator to avoid separate module dependency.
+// Local scroll accumulator
 const Scroll = struct {
     pub var dy: f64 = 0.0;
 };
@@ -241,7 +232,7 @@ fn onScroll(_: ?*glfw.Window, _: f64, yoff: f64) callconv(.c) void {
     Scroll.dy += yoff;
 }
 
-// Keep/restore previous GLFW scroll callback (safer for long-term composability)
+// Keep/restore previous GLFW scroll callback (safer for composability)
 const ScrollCB = ?*const fn (?*glfw.Window, f64, f64) callconv(.c) void;
 var prev_scroll_cb: ScrollCB = null;
 
@@ -251,9 +242,6 @@ fn installScroll(window: *glfw.Window) void {
 fn restoreScroll(window: *glfw.Window) void {
     _ = glfw.setScrollCallback(window, prev_scroll_cb);
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Small math helpers
 
 inline fn clamp01(x: f32) f32 {
     if (x < 0.0) return 0.0;
@@ -284,18 +272,11 @@ fn mulPoint4x4(m: [16]f32, p: [4]f32) [4]f32 {
 }
 
 fn centerInsideClip(vp: [16]f32, world_center: [3]f32) bool {
-    // Homogeneous clip coords
     const c = mulPoint4x4(vp, .{ world_center[0], world_center[1], world_center[2], 1.0 });
-
-    // Behind the camera → culled
     if (c[3] <= 0.0) return false;
-
-    // Vulkan clip space: x,y ∈ [-w, +w], z ∈ [0, +w]
     const ax = @abs(c[0]);
     const ay = @abs(c[1]);
-    // small pad reduces edge popping when the center is near the frustum planes
     const pad: f32 = 1.02;
-
     return (ax <= c[3] * pad) and
         (ay <= c[3] * pad) and
         (c[2] >= 0.0) and (c[2] <= c[3] * pad);
@@ -368,7 +349,6 @@ fn scatterInstances(seed: u64) void {
         spin_axis[i] = randUnitVec3(&s);
         spin_speed[i] = 0.4 + 1.6 * uniform01(&s);
 
-        // HSV-ish packed into inst_color: (v,s,h,1)
         const h = uniform01(&s);
         const sat = 0.45 + 0.25 * uniform01(&s);
         const val = 0.8 + 0.2 * uniform01(&s);
@@ -537,159 +517,17 @@ fn writeUnitCube(verts: []Vertex) void {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// File IO helpers
-fn nowMsFromGlfw() i64 {
-    return @as(i64, @intFromFloat(glfw.getTime() * 1000.0));
-}
-
-fn errorCallback(err_code: c_int, desc: [*c]const u8) callconv(.c) void {
-    var msg: []const u8 = "no description";
-    if (desc) |p| {
-        const z: [*:0]const u8 = @ptrCast(p);
-        msg = std.mem.span(z);
-    }
-    if (glfw.errorCodeFromC(err_code)) |e| {
-        std.log.err("GLFW error {s} ({d}): {s}", .{ @tagName(e), err_code, msg });
-    } else {
-        std.log.err("GLFW error code: {d}: {s}", .{ err_code, msg });
-    }
-}
-
-fn waitForNonZeroFramebuffer(window: *glfw.Window) void {
-    const deadline = nowMsFromGlfw() + 250;
-    while (true) {
-        const fb = glfw.getFramebufferSize(window);
-        if (fb.width > 0 and fb.height > 0) break;
-        glfw.pollEvents();
-        if (nowMsFromGlfw() >= deadline) break;
-    }
-}
-
-fn toggleFullscreen(window: *glfw.Window) void {
-    if (!WindowState.fullscreen) {
-        const pos = glfw.getWindowPos(window);
-        const sz = glfw.getWindowSize(window);
-        WindowState.saved_x = pos.x;
-        WindowState.saved_y = pos.y;
-        WindowState.saved_w = sz.width;
-        WindowState.saved_h = sz.height;
-
-        const mon = glfw.getPrimaryMonitor() orelse return;
-        const mode = glfw.getVideoMode(mon) orelse return;
-        glfw.setWindowMonitor(window, mon, 0, 0, mode.width, mode.height, mode.refresh_rate);
-        WindowState.fullscreen = true;
-    } else {
-        glfw.setWindowMonitor(
-            window,
-            null,
-            WindowState.saved_x,
-            WindowState.saved_y,
-            WindowState.saved_w,
-            WindowState.saved_h,
-            0,
-        );
-        WindowState.fullscreen = false;
-    }
-}
-
-fn handleFullscreenShortcuts(window: *glfw.Window) void {
-    const Latch = struct {
-        var altenter: bool = false;
-        var f11: bool = false;
-        var cmdctrlf: bool = false;
-    };
-
-    var toggle = false;
-
-    if (CONFIG.allow_alt_enter) {
-        const alt = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_ALT) == glfw.c.GLFW_PRESS) or
-            (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_ALT) == glfw.c.GLFW_PRESS);
-        const enter = glfw.getKey(window, glfw.c.GLFW_KEY_ENTER) == glfw.c.GLFW_PRESS;
-        const down = alt and enter;
-        if (down and !Latch.altenter) toggle = true;
-        Latch.altenter = down;
-    }
-
-    if (CONFIG.allow_f11) {
-        const down = glfw.getKey(window, glfw.c.GLFW_KEY_F11) == glfw.c.GLFW_PRESS;
-        if (down and !Latch.f11) toggle = true;
-        Latch.f11 = down;
-    }
-
-    if (CONFIG.allow_cmd_ctrl_f_mac) {
-        const cmd = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_SUPER) == glfw.c.GLFW_PRESS) or
-            (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_SUPER) == glfw.c.GLFW_PRESS);
-        const ctrl = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_CONTROL) == glfw.c.GLFW_PRESS) or
-            (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_CONTROL) == glfw.c.GLFW_PRESS);
-        const f = glfw.getKey(window, glfw.c.GLFW_KEY_F) == glfw.c.GLFW_PRESS;
-        const down = cmd and ctrl and f;
-        if (down and !Latch.cmdctrlf) toggle = true;
-        Latch.cmdctrlf = down;
-    }
-
-    if (toggle) toggleFullscreen(window);
-}
-
-fn sampleCameraInput(window: *glfw.Window, look_active: bool, dt: f32) CameraInput {
-    var ci: CameraInput = .{};
-
-    // Movement keys
-    if (glfw.getKey(window, glfw.c.GLFW_KEY_W) != glfw.c.GLFW_RELEASE) ci.move_forward = true;
-    if (glfw.getKey(window, glfw.c.GLFW_KEY_S) != glfw.c.GLFW_RELEASE) ci.move_backward = true;
-    if (glfw.getKey(window, glfw.c.GLFW_KEY_A) != glfw.c.GLFW_RELEASE) ci.move_left = true;
-    if (glfw.getKey(window, glfw.c.GLFW_KEY_D) != glfw.c.GLFW_RELEASE) ci.move_right = true;
-    if (glfw.getKey(window, glfw.c.GLFW_KEY_SPACE) != glfw.c.GLFW_RELEASE) ci.move_up = true;
-    if (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_CONTROL) != glfw.c.GLFW_RELEASE) ci.move_down = true;
-
-    if (!look_active) {
-        LookState.have_prev = false;
-        return ci;
-    }
-
-    // Raw mouse → filtered, “human-like” deltas
-    const raw = glfw.getCursorPos(window);
-    const pos = [2]f64{ raw.x, raw.y };
-
-    // Skip first frame after lock to avoid giant jump
-    if (InputState.just_locked or !LookState.have_prev) {
-        LookState.have_prev = true;
-        LookState.prev_pos = pos;
-        InputState.just_locked = false;
-        return ci;
-    }
-
-    const dx_px = pos[0] - LookState.prev_pos[0];
-    const dy_px = pos[1] - LookState.prev_pos[1];
-    LookState.prev_pos = pos;
-
-    // Low-pass filter in pixel space (dt-aware)
-    const a = smoothingAlpha(CONFIG.look_smooth_halflife_ms, dt);
-    LookState.filt_dx += a * (@as(f32, @floatCast(dx_px)) - LookState.filt_dx);
-    LookState.filt_dy += a * (@as(f32, @floatCast(dy_px)) - LookState.filt_dy);
-
-    // Sensitivity + gentle expo curve
-    const lx = applyExpo(LookState.filt_dx * CONFIG.mouse_sens, CONFIG.look_expo);
-    var ly = applyExpo(LookState.filt_dy * CONFIG.mouse_sens, CONFIG.look_expo);
-    if (CONFIG.invert_y) ly = -ly;
-
-    // Hand to camera system
-    ci.look_delta_x = lx;
-    ci.look_delta_y = ly;
-    return ci;
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Small file helpers (config + shaders)
-fn readAllAllocAbsolute(alloc: Allocator, abs_path: []const u8, max_bytes: usize) ![]u8 {
+// File IO + shader loading (4-byte aligned SPIR-V reads)
+fn readAlignedAbsolute2(alloc: std.mem.Allocator, abs_path: []const u8) ![]u8 {
     var file = try std.fs.openFileAbsolute(abs_path, .{});
     defer file.close();
 
-    const st = try file.stat();
-    if (st.size == 0) return error.EmptyFile;
-    if (st.size > max_bytes) return error.FileTooBig;
+    const end_pos = try file.getEndPos();
+    if (end_pos == 0) return error.EmptyFile;
+    if (end_pos > 16 * 1024 * 1024) return error.FileTooBig;
 
-    const size: usize = @intCast(st.size);
-    var buf = try alloc.alloc(u8, size);
+    const size: usize = @intCast(end_pos);
+    var buf = try alloc.alignedAlloc(u8, .@"4", size);
     errdefer alloc.free(buf);
 
     var off: usize = 0;
@@ -699,20 +537,21 @@ fn readAllAllocAbsolute(alloc: Allocator, abs_path: []const u8, max_bytes: usize
         off += n;
     }
     if (off != size) return error.UnexpectedEof;
+    if (size % 4 != 0) return error.BadSpirvSize;
 
     return buf;
 }
 
-fn readAllAllocFromDir(alloc: Allocator, dir: std.fs.Dir, sub_path: []const u8, max_bytes: usize) ![]u8 {
-    var file = try dir.openFile(sub_path, .{});
+fn readAlignedFromCwd2(alloc: std.mem.Allocator, rel: []const u8) ![]u8 {
+    var file = try std.fs.cwd().openFile(rel, .{});
     defer file.close();
 
-    const size_u64 = try file.getEndPos();
-    if (size_u64 == 0) return error.EmptyFile;
-    if (size_u64 > max_bytes) return error.FileTooBig;
+    const end_pos = try file.getEndPos();
+    if (end_pos == 0) return error.EmptyFile;
+    if (end_pos > 16 * 1024 * 1024) return error.FileTooBig;
 
-    const size: usize = @intCast(size_u64);
-    var buf = try alloc.alloc(u8, size);
+    const size: usize = @intCast(end_pos);
+    var buf = try alloc.alignedAlloc(u8, .@"4", size);
     errdefer alloc.free(buf);
 
     var off: usize = 0;
@@ -722,173 +561,57 @@ fn readAllAllocFromDir(alloc: Allocator, dir: std.fs.Dir, sub_path: []const u8, 
         off += n;
     }
     if (off != size) return error.UnexpectedEof;
+    if (size % 4 != 0) return error.BadSpirvSize;
 
     return buf;
 }
 
-fn parseCameraStyle(s: []const u8) ?CameraStyle {
-    if (std.ascii.eqlIgnoreCase(s, "fly") or std.ascii.eqlIgnoreCase(s, "fps") or std.ascii.eqlIgnoreCase(s, "free")) {
-        return .fly;
-    }
-    if (std.ascii.eqlIgnoreCase(s, "orbit") or
-        std.ascii.eqlIgnoreCase(s, "blender") or
-        std.ascii.eqlIgnoreCase(s, "blender_orbit") or
-        std.ascii.eqlIgnoreCase(s, "design"))
-    {
-        return .blender_orbit;
-    }
-    return null;
-}
-
-fn overlayConfig(base: Config, file: ConfigFile) Config {
-    var out = base;
-    if (file.fov_deg) |v| out.fov_deg = v;
-    if (file.mouse_sens) |v| out.mouse_sens = v;
-    if (file.invert_y) |v| out.invert_y = v;
-    if (file.enable_raw_mouse) |v| out.enable_raw_mouse = v;
-    if (file.base_move_speed_scale) |v| out.base_move_speed_scale = v;
-    if (file.sprint_mult) |v| out.sprint_mult = v;
-    if (file.allow_alt_enter) |v| out.allow_alt_enter = v;
-    if (file.allow_f11) |v| out.allow_f11 = v;
-    if (file.allow_cmd_ctrl_f_mac) |v| out.allow_cmd_ctrl_f_mac = v;
-    if (file.debug_heartbeat_every) |v| out.debug_heartbeat_every = v;
-    if (file.debug_no_draw) |v| out.debug_no_draw = v;
-    if (file.look_smooth_halflife_ms) |v| out.look_smooth_halflife_ms = v;
-    if (file.look_expo) |v| out.look_expo = v;
-    if (file.max_pitch_deg) |v| out.max_pitch_deg = v;
-    if (file.camera_style) |s| {
-        if (parseCameraStyle(s)) |mode| {
-            out.camera_style = mode;
-        }
-    }
-    return out;
-}
-
-fn loadConfig(alloc: Allocator) Config {
-    const filename = "config.json";
-    var cfg: Config = .{};
-
-    // 1) Try executable directory
-    if (std.fs.selfExeDirPathAlloc(alloc) catch null) |exe_dir_path| {
-        defer alloc.free(exe_dir_path);
-
-        if (std.fs.path.join(alloc, &.{ exe_dir_path, filename }) catch null) |full_path| {
-            defer alloc.free(full_path);
-
-            if (readAllAllocAbsolute(alloc, full_path, 1 << 20) catch null) |bytes| {
-                defer alloc.free(bytes);
-
-                const parsed = std.json.parseFromSlice(ConfigFile, alloc, bytes, .{
-                    .ignore_unknown_fields = true,
-                }) catch {
-                    std.log.warn("config.json in exe dir: parse failed; using defaults", .{});
-                    return cfg;
-                };
-                defer parsed.deinit();
-
-                cfg = overlayConfig(cfg, parsed.value);
-                std.log.info("Loaded config.json from executable directory", .{});
-                return cfg;
-            }
-        }
-    }
-
-    // 2) Try current working directory
-    if (readAllAllocFromDir(alloc, std.fs.cwd(), filename, 1 << 20) catch null) |bytes| {
-        defer alloc.free(bytes);
-
-        const parsed = std.json.parseFromSlice(ConfigFile, alloc, bytes, .{
-            .ignore_unknown_fields = true,
-        }) catch {
-            std.log.warn("config.json in CWD: parse failed; using defaults", .{});
-            return cfg;
-        };
-        defer parsed.deinit();
-
-        cfg = overlayConfig(cfg, parsed.value);
-        std.log.info("Loaded config.json from current working directory", .{});
-        return cfg;
-    }
-
-    std.log.info("config.json not found; using defaults", .{});
-    return cfg;
-}
-
-// Shader loaders
-fn readFileAlignedAbsolute(alloc: Allocator, abs_path: []const u8, comptime alignment: std.mem.Alignment) ![]u8 {
-    var file = try std.fs.openFileAbsolute(abs_path, .{});
-    defer file.close();
-
-    const st = try file.stat();
-    if (st.size == 0) return error.EmptyFile;
-
-    const size: usize = @intCast(st.size);
-    var tmp = try alloc.alloc(u8, size);
-    defer alloc.free(tmp);
-
-    var off: usize = 0;
-    while (off < size) {
-        const n = try file.read(tmp[off..]);
-        if (n == 0) break;
-        off += n;
-    }
-    if (off != size) return error.UnexpectedEof;
-
-    const out = try alloc.alignedAlloc(u8, alignment, size);
-    @memcpy(out, tmp);
-    return out;
-}
-
-fn loadSpirvFrom(alloc: Allocator, abs: []const u8) ![]u8 {
-    const bytes = try readFileAlignedAbsolute(alloc, abs, .@"4");
-    if (bytes.len % 4 != 0) {
-        alloc.free(bytes);
-        return error.BadSpirvSize;
-    }
-    return bytes;
-}
-
-// Build "roots" without mismatched array types. Returns slice backed by caller.
-fn buildAssetRoots(out: *[4][]const u8, exe_dir: []const u8, assets_from_exe: ?[]const u8) []const []const u8 {
-    var n: usize = 0;
-    out[n] = exe_dir;
-    n += 1;
-    if (assets_from_exe) |p| {
-        out[n] = p;
-        n += 1;
-    }
-    out[n] = ".";
-    n += 1;
-    out[n] = "assets";
-    n += 1;
-    return out[0..n];
-}
-
-fn loadShaderBytes(alloc: Allocator, rel: []const u8) ![]u8 {
-    const exe_dir = try std.fs.selfExeDirPathAlloc(alloc);
-    defer alloc.free(exe_dir);
-
-    const assets_from_exe = std.fs.path.resolve(alloc, &.{ exe_dir, "..", "assets" }) catch null;
-    defer if (assets_from_exe) |p| alloc.free(p);
-
-    var roots_buf: [4][]const u8 = undefined;
-    const roots = buildAssetRoots(&roots_buf, exe_dir, assets_from_exe);
-
+fn loadShaderBytes(allocator: std.mem.Allocator, rel_path: []const u8) ![]u8 {
     var last_err: anyerror = error.FileNotFound;
 
-    for (roots) |root| {
-        const full = std.fs.path.join(alloc, &.{ root, rel }) catch continue;
-        defer alloc.free(full);
+    // 1) <exe_dir>/<rel_path>
+    if (std.fs.selfExeDirPathAlloc(allocator) catch null) |exe_dir| {
+        defer allocator.free(exe_dir);
 
-        const bytes = loadSpirvFrom(alloc, full) catch |e| {
-            last_err = e;
-            continue;
-        };
+        if (std.fs.path.join(allocator, &.{ exe_dir, rel_path }) catch null) |abs1| {
+            defer allocator.free(abs1);
+            if (readAlignedAbsolute2(allocator, abs1)) |bytes| {
+                std.log.info("Loaded shader from exe dir: {s}", .{abs1});
+                return bytes;
+            } else |e| last_err = e;
+        }
 
-        std.log.info("Loaded shader: {s}", .{full});
-        return bytes;
+        // 2) <exe_dir>/../assets/<rel_path>
+        if (std.fs.path.resolve(allocator, &.{ exe_dir, "..", "assets", rel_path }) catch null) |abs2| {
+            defer allocator.free(abs2);
+            if (readAlignedAbsolute2(allocator, abs2)) |bytes| {
+                std.log.info("Loaded shader from exe assets: {s}", .{abs2});
+                return bytes;
+            } else |e| last_err = e;
+        }
     }
+
+    // 3) CWD/<rel_path>
+    if (readAlignedFromCwd2(allocator, rel_path)) |bytes| {
+        std.log.info("Loaded shader from CWD: {s}", .{rel_path});
+        return bytes;
+    } else |e| last_err = e;
+
+    // 4) CWD/assets/<rel_path>
+    if (std.fs.path.join(allocator, &.{ "assets", rel_path }) catch null) |rel_assets| {
+        defer allocator.free(rel_assets);
+        if (readAlignedFromCwd2(allocator, rel_assets)) |bytes| {
+            std.log.info("Loaded shader from CWD assets: {s}", .{rel_assets});
+            return bytes;
+        } else |e| last_err = e;
+    }
+
     return last_err;
+}
+
+fn loadConfig(_: std.mem.Allocator) Config {
+    // TODO: optionally read JSON/TOML later; defaults are fine for now.
+    return .{};
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -948,9 +671,7 @@ fn createPipeline(gc: *const GraphicsContext, layout: vk.PipelineLayout, render_
     const a_v2 = Vertex.attribute_description[2];
 
     const attrs = [_]vk.VertexInputAttributeDescription{
-        // per-vertex (binding 0)
         a_v0,                                                                           a_v1,                                                                                                               a_v2,
-        // per-instance (binding 1): four vec4s for model, then one vec4 for color
         .{ .location = 3, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = 0 },  .{ .location = 4, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = 16 },                                     .{ .location = 5, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = 32 },
         .{ .location = 6, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = 48 }, .{ .location = 7, .binding = 1, .format = .r32g32b32a32_sfloat, .offset = @intCast(@offsetOf(Instance, "color")) },
     };
@@ -966,16 +687,14 @@ fn createPipeline(gc: *const GraphicsContext, layout: vk.PipelineLayout, render_
     const ia = vk.PipelineInputAssemblyStateCreateInfo{ .flags = .{}, .topology = .triangle_list, .primitive_restart_enable = VK_FALSE32 };
     const vp = vk.PipelineViewportStateCreateInfo{ .flags = .{}, .viewport_count = 1, .p_viewports = undefined, .scissor_count = 1, .p_scissors = undefined };
 
-    // With negative viewport height we use .clockwise for "front"
-    const front_face_mode: vk.FrontFace = if (VIEWPORT_Y_FLIP) .clockwise else .counter_clockwise;
-
+    // Positive viewport height everywhere; standard front face.
     const rs = vk.PipelineRasterizationStateCreateInfo{
         .flags = .{},
         .depth_clamp_enable = VK_FALSE32,
         .rasterizer_discard_enable = VK_FALSE32,
         .polygon_mode = .fill,
-        .cull_mode = .{}, // disabled while iterating
-        .front_face = front_face_mode,
+        .cull_mode = .{}, // disabled while iterating; safe default
+        .front_face = .counter_clockwise,
         .depth_bias_enable = VK_FALSE32,
         .depth_bias_constant_factor = 0,
         .depth_bias_clamp = 0,
@@ -1209,7 +928,6 @@ pub fn main() !void {
         std.log.warn("CONFIG.debug_no_draw=true → draw calls are skipped", .{});
     }
 
-    // Window extent ~75% of work area
     var extent = vk.Extent2D{ .width = 1280, .height = 800 };
     glfw.defaultWindowHints();
     glfw.windowHint(glfw.c.GLFW_CLIENT_API, glfw.c.GLFW_NO_API);
@@ -1228,7 +946,6 @@ pub fn main() !void {
     const window = try glfw.createWindow(@as(i32, @intCast(extent.width)), @as(i32, @intCast(extent.height)), window_title_cstr, null, null);
     defer glfw.destroyWindow(window);
 
-    // Install our scroll handler and ensure we restore whatever was there on exit
     installScroll(window);
     defer restoreScroll(window);
 
@@ -1252,7 +969,6 @@ pub fn main() !void {
     var gc = try GraphicsContext.init(A, window_title_cstr, window);
     defer gc.deinit();
 
-    // Device + API debug
     const props = gc.vki.getPhysicalDeviceProperties(gc.pdev);
     std.log.info("GPU: {s} | API {d}.{d}.{d}", .{
         std.mem.sliceTo(&props.device_name, 0),
@@ -1286,8 +1002,7 @@ pub fn main() !void {
     });
     defer depth_res.destroy(gc.vkd, gc.dev, null);
 
-    // Descriptor set layout (set=0). Bindings must match build defines:
-    // UBO_BINDING=0, TEX_BINDING=1 (see build.zig glslc args).
+    // Descriptor set layout (set=0).
     const ubo_binding_index: u32 = 0;
     const sampler_binding_index: u32 = 1;
 
@@ -1555,7 +1270,6 @@ pub fn main() !void {
     var orbit_enabled: bool = false;
     var orbit: Orbit.OrbitState = .{};
 
-    // Instance scatter (deterministic)
     scatterInstances(0xCAFEBABE1234_5678);
 
     std.log.info("Entering main loop…", .{});
@@ -1563,32 +1277,27 @@ pub fn main() !void {
     var frame_count: u64 = 0;
 
     while (!glfw.windowShouldClose(window)) {
-        // Acquire info for current swap image and wait its fence before touching mapped memory
         const img_index = swapchain.image_index;
         const cur_img = swapchain.currentSwapImage();
         try cur_img.*.waitForFence(&gc);
 
         const tick = frame_timer.tick(nowMsFromGlfw());
-        const raw_dt = @as(f32, @floatCast(tick.dt)); // look smoothing uses real dt
+        const raw_dt = @as(f32, @floatCast(tick.dt));
         var move_dt = raw_dt * CONFIG.base_move_speed_scale;
 
-        // Sprint affects movement only
         const lshift = glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_SHIFT);
         const rshift = glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_SHIFT);
         const sprinting = (lshift != glfw.c.GLFW_RELEASE) or (rshift != glfw.c.GLFW_RELEASE);
         if (sprinting) move_dt *= CONFIG.sprint_mult;
 
-        // Fullscreen, Quit
         handleFullscreenShortcuts(window);
         const esc = glfw.getKey(window, glfw.c.GLFW_KEY_ESCAPE);
         if (esc == glfw.c.GLFW_PRESS or esc == glfw.c.GLFW_REPEAT) glfw.setWindowShouldClose(window, true);
 
-        // Rescatter: R (debug)
         if (glfw.getKey(window, glfw.c.GLFW_KEY_R) == glfw.c.GLFW_PRESS) {
             scatterInstances(0xCAFEBABE1234_5678);
         }
 
-        // Orbit toggle with target pick
         const okey = glfw.getKey(window, glfw.c.GLFW_KEY_O) == glfw.c.GLFW_PRESS;
         const OToggle = struct {
             var prev: bool = false;
@@ -1615,7 +1324,6 @@ pub fn main() !void {
         }
         OToggle.prev = okey;
 
-        // ── RMB edge latch (press → lock, release → unlock)
         const rmb_down = (glfw.getMouseButton(window, glfw.c.GLFW_MOUSE_BUTTON_RIGHT) == glfw.c.GLFW_PRESS);
         const became_down = rmb_down and !MouseLatch.rmb_was_down;
         const became_up = !rmb_down and MouseLatch.rmb_was_down;
@@ -1634,8 +1342,8 @@ pub fn main() !void {
 
         if (became_down) {
             glfw.setInputMode(window, glfw.c.GLFW_CURSOR, glfw.c.GLFW_CURSOR_DISABLED);
-            InputState.just_locked = true; // one frame only
-            LookState.have_prev = false; // reset look filter
+            InputState.just_locked = true;
+            LookState.have_prev = false;
             LookState.filt_dx = 0;
             LookState.filt_dy = 0;
         }
@@ -1643,22 +1351,18 @@ pub fn main() !void {
             glfw.setInputMode(window, glfw.c.GLFW_CURSOR, glfw.c.GLFW_CURSOR_NORMAL);
         }
 
-        // Sample input (use raw_dt for smoothing/filters)
         const cin = sampleCameraInput(window, rmb_down, raw_dt);
 
-        // --- Wheel (zoom/dolly) ------------------------------------------------------
         if (orbit_enabled) {
             const wheel = @as(f32, @floatCast(Scroll.dy));
             if (wheel != 0) {
-                // Scroll up (+) → zoom in (smaller radius). Using multiplicative dolly.
                 const factor = std.math.pow(f32, CONFIG.orbit_dolly_wheel, -wheel);
                 const r = orbit.radius * factor;
                 orbit.radius = @max(CONFIG.orbit_min_radius, @min(CONFIG.orbit_max_radius, r));
-                Scroll.dy = 0; // clear after consuming
+                Scroll.dy = 0;
             }
         }
 
-        // Update fly camera from WASD/mouse
         camera.update(move_dt, cin);
 
         // Build Scene UBO for THIS image
@@ -1693,6 +1397,7 @@ pub fn main() !void {
             CUBE_INSTANCES - 1,
         );
 
+        // Explicit flush helps on some stacks (even with HOST_COHERENT)
         {
             const ranges = [_]vk.MappedMemoryRange{
                 .{ .memory = ubo_mems[img_index], .offset = 0, .size = vk.WHOLE_SIZE },
@@ -1701,26 +1406,38 @@ pub fn main() !void {
             try gc.vkd.flushMappedMemoryRanges(gc.dev, @intCast(ranges.len), &ranges);
         }
 
-        // Heartbeat
-        if (frame_count < 3 or (CONFIG.debug_heartbeat_every != 0 and (frame_count % CONFIG.debug_heartbeat_every) == 0)) {
-            std.log.info("Frame: img_index={d} extent={d}x{d} vis={d}", .{ img_index, swapchain.extent.width, swapchain.extent.height, visible_count });
+        if (tick.fps_updated) {
+            var buf_title: [200]u8 = undefined;
+            const title = std.fmt.bufPrintZ(
+                &buf_title,
+                "{s} | FPS: {d:.1} | vis:{d}",
+                .{ window_title_base, tick.fps, visible_count },
+            ) catch null;
+            if (title) |z| glfw.setWindowTitle(window, z);
         }
 
-        // Record
         const cmdbuf = cmdbufs[img_index];
         try gc.vkd.resetCommandBuffer(cmdbuf, .{});
         try gc.vkd.beginCommandBuffer(cmdbuf, &vk.CommandBufferBeginInfo{ .flags = .{}, .p_inheritance_info = null });
 
         const fb_extent = swapchain.extent;
 
+        // Positive height everywhere (no negative viewport).
         var viewport = vk.Viewport{
             .x = 0,
-            .y = if (VIEWPORT_Y_FLIP) @as(f32, @floatFromInt(fb_extent.height)) else 0,
+            .y = if (VIEWPORT_Y_FLIP)
+                @as(f32, @floatFromInt(fb_extent.height))
+            else
+                0,
             .width = @as(f32, @floatFromInt(fb_extent.width)),
-            .height = if (VIEWPORT_Y_FLIP) -@as(f32, @floatFromInt(fb_extent.height)) else @as(f32, @floatFromInt(fb_extent.height)),
+            .height = if (VIEWPORT_Y_FLIP)
+                -@as(f32, @floatFromInt(fb_extent.height))
+            else
+                @as(f32, @floatFromInt(fb_extent.height)),
             .min_depth = 0,
             .max_depth = 1,
         };
+
         const scissor = vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = fb_extent };
 
         const clear_color = vk.ClearValue{ .color = .{ .float_32 = .{ 0.05, 0.05, 0.07, 1.0 } } };
@@ -1746,15 +1463,14 @@ pub fn main() !void {
         gc.vkd.cmdBindDescriptorSets(cmdbuf, .graphics, pipeline_layout, 0, 1, @ptrCast(&sets[img_index]), 0, undefined);
 
         if (!CONFIG.debug_no_draw) {
-            // Floor
             gc.vkd.cmdDraw(cmdbuf, FLOOR_VERTS, 1, 0, 0);
-            // Cubes use instances [1 .. 1+visible_count)
             if (visible_count > 0) {
                 gc.vkd.cmdDraw(cmdbuf, CUBE_VERTS, @intCast(visible_count), FLOOR_VERTS, 1);
             }
         }
 
         gc.vkd.cmdEndRenderPass(cmdbuf);
+
         try gc.vkd.endCommandBuffer(cmdbuf);
 
         const state = swapchain.present(cmdbuf) catch |err| switch (err) {
@@ -1766,7 +1482,6 @@ pub fn main() !void {
             else => |narrow| return narrow,
         };
 
-        // Resize path — guard against 0×0 during minimize
         if (state == .suboptimal) {
             waitForNonZeroFramebuffer(window);
             const fb2 = glfw.getFramebufferSize(window);
@@ -1803,7 +1518,6 @@ pub fn main() !void {
                 });
                 framebuffers = try createFramebuffers(&gc, A, render_pass, swapchain, depth_res.view);
 
-                // Realloc cmdbufs to match swapchain
                 gc.vkd.freeCommandBuffers(gc.dev, cmd_pool, @intCast(cmdbufs.len), cmdbufs.ptr);
                 A.free(cmdbufs);
 
@@ -1824,17 +1538,6 @@ pub fn main() !void {
             }
         }
 
-        // Title (FPS minimal)
-        if (tick.fps_updated) {
-            var buf_title: [200]u8 = undefined;
-            const title = std.fmt.bufPrintZ(
-                &buf_title,
-                "{s} | FPS: {d:.1} | vis:{d}",
-                .{ window_title_base, tick.fps, visible_count },
-            ) catch null;
-            if (title) |z| glfw.setWindowTitle(window, z);
-        }
-
         frame_count += 1;
         glfw.pollEvents();
     }
@@ -1842,7 +1545,153 @@ pub fn main() !void {
     try swapchain.waitForAllFences();
 }
 
-// ── Sanity test (at most one Y-flip path is enabled)
-test "at most one Y-flip path is enabled" {
-    try std.testing.expect(!(VIEWPORT_Y_FLIP and PROJECTION_Y_FLIP));
+// ──────────────────────────────────────────────────────────────────────────────
+// GLFW helpers (error, wait, fullscreen)
+fn nowMsFromGlfw() i64 {
+    return @as(i64, @intFromFloat(glfw.getTime() * 1000.0));
+}
+
+fn errorCallback(err_code: c_int, desc: [*c]const u8) callconv(.c) void {
+    var msg: []const u8 = "no description";
+    if (desc) |p| {
+        const z: [*:0]const u8 = @ptrCast(p);
+        msg = std.mem.span(z);
+    }
+    if (glfw.errorCodeFromC(err_code)) |e| {
+        std.log.err("GLFW error {s} ({d}): {s}", .{ @tagName(e), err_code, msg });
+    } else {
+        std.log.err("GLFW error code: {d}: {s}", .{ err_code, msg });
+    }
+}
+
+fn waitForNonZeroFramebuffer(window: *glfw.Window) void {
+    const deadline = nowMsFromGlfw() + 250;
+    while (true) {
+        const fb = glfw.getFramebufferSize(window);
+        if (fb.width > 0 and fb.height > 0) break;
+        glfw.pollEvents();
+        if (nowMsFromGlfw() >= deadline) break;
+    }
+}
+
+fn toggleFullscreen(window: *glfw.Window) void {
+    if (!WindowState.fullscreen) {
+        const pos = glfw.getWindowPos(window);
+        const sz = glfw.getWindowSize(window);
+        WindowState.saved_x = pos.x;
+        WindowState.saved_y = pos.y;
+        WindowState.saved_w = sz.width;
+        WindowState.saved_h = sz.height;
+
+        const mon = glfw.getPrimaryMonitor() orelse return;
+        const mode = glfw.getVideoMode(mon) orelse return;
+        glfw.setWindowMonitor(window, mon, 0, 0, mode.width, mode.height, mode.refresh_rate);
+        WindowState.fullscreen = true;
+    } else {
+        glfw.setWindowMonitor(
+            window,
+            null,
+            WindowState.saved_x,
+            WindowState.saved_y,
+            WindowState.saved_w,
+            WindowState.saved_h,
+            0,
+        );
+        WindowState.fullscreen = false;
+    }
+}
+
+fn handleFullscreenShortcuts(window: *glfw.Window) void {
+    const Latch = struct {
+        var altenter: bool = false;
+        var f11: bool = false;
+        var cmdctrlf: bool = false;
+    };
+
+    var toggle = false;
+
+    if (CONFIG.allow_alt_enter) {
+        const alt = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_ALT) == glfw.c.GLFW_PRESS) or
+            (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_ALT) == glfw.c.GLFW_PRESS);
+        const enter = glfw.getKey(window, glfw.c.GLFW_KEY_ENTER) == glfw.c.GLFW_PRESS;
+        const down = alt and enter;
+        if (down and !Latch.altenter) toggle = true;
+        Latch.altenter = down;
+    }
+
+    if (CONFIG.allow_f11) {
+        const down = glfw.getKey(window, glfw.c.GLFW_KEY_F11) == glfw.c.GLFW_PRESS;
+        if (down and !Latch.f11) toggle = true;
+        Latch.f11 = down;
+    }
+
+    if (CONFIG.allow_cmd_ctrl_f_mac) {
+        const cmd = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_SUPER) == glfw.c.GLFW_PRESS) or
+            (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_SUPER) == glfw.c.GLFW_PRESS);
+        const ctrl = (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_CONTROL) == glfw.c.GLFW_PRESS) or
+            (glfw.getKey(window, glfw.c.GLFW_KEY_RIGHT_CONTROL) == glfw.c.GLFW_PRESS);
+        const f = glfw.getKey(window, glfw.c.GLFW_KEY_F) == glfw.c.GLFW_PRESS;
+        const down = cmd and ctrl and f;
+        if (down and !Latch.cmdctrlf) toggle = true;
+        Latch.cmdctrlf = down;
+    }
+
+    if (toggle) toggleFullscreen(window);
+}
+
+// Input sampling
+fn sampleCameraInput(window: *glfw.Window, look_active: bool, dt: f32) CameraInput {
+    var ci: CameraInput = .{};
+
+    // Movement keys
+    if (glfw.getKey(window, glfw.c.GLFW_KEY_W) != glfw.c.GLFW_RELEASE) ci.move_forward = true;
+    if (glfw.getKey(window, glfw.c.GLFW_KEY_S) != glfw.c.GLFW_RELEASE) ci.move_backward = true;
+    if (glfw.getKey(window, glfw.c.GLFW_KEY_A) != glfw.c.GLFW_RELEASE) ci.move_left = true;
+    if (glfw.getKey(window, glfw.c.GLFW_KEY_D) != glfw.c.GLFW_RELEASE) ci.move_right = true;
+    if (glfw.getKey(window, glfw.c.GLFW_KEY_SPACE) != glfw.c.GLFW_RELEASE) ci.move_up = true;
+    if (glfw.getKey(window, glfw.c.GLFW_KEY_LEFT_CONTROL) != glfw.c.GLFW_RELEASE) ci.move_down = true;
+
+    if (!look_active) {
+        LookState.have_prev = false;
+        return ci;
+    }
+
+    // Raw mouse → filtered, “human-like” deltas
+    const raw = glfw.getCursorPos(window);
+    const pos = [2]f64{ raw.x, raw.y };
+
+    // Skip first frame after lock to avoid giant jump
+    if (InputState.just_locked or !LookState.have_prev) {
+        LookState.have_prev = true;
+        LookState.prev_pos = pos;
+        InputState.just_locked = false;
+        return ci;
+    }
+
+    const dx_px = pos[0] - LookState.prev_pos[0];
+    const dy_px = pos[1] - LookState.prev_pos[1];
+    LookState.prev_pos = pos;
+
+    const a = smoothingAlpha(CONFIG.look_smooth_halflife_ms, dt);
+    LookState.filt_dx += a * (@as(f32, @floatCast(dx_px)) - LookState.filt_dx);
+    LookState.filt_dy += a * (@as(f32, @floatCast(dy_px)) - LookState.filt_dy);
+
+    const lx = applyExpo(LookState.filt_dx * CONFIG.mouse_sens, CONFIG.look_expo);
+    var ly = applyExpo(LookState.filt_dy * CONFIG.mouse_sens, CONFIG.look_expo);
+    if (CONFIG.invert_y) ly = -ly;
+
+    ci.look_delta_x = lx;
+    ci.look_delta_y = ly;
+    return ci;
+}
+
+// ── Sanity test (projection flip only on macOS)
+test "platform Y-flip policy" {
+    if (IS_MAC) {
+        try std.testing.expect(VIEWPORT_Y_FLIP == true);
+        try std.testing.expect(PROJECTION_Y_FLIP == false);
+    } else {
+        try std.testing.expect(VIEWPORT_Y_FLIP == false);
+        try std.testing.expect(PROJECTION_Y_FLIP == true);
+    }
 }

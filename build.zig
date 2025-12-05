@@ -1,10 +1,9 @@
+// (unchanged)
 const std = @import("std");
 
-//
 // ──────────────────────────────────────────────────────────────────────────────
 // Vulkan loader linking
 // ──────────────────────────────────────────────────────────────────────────────
-//
 fn linkVulkanLoader(
     exe: *std.Build.Step.Compile,
     target: std.Build.ResolvedTarget,
@@ -26,11 +25,9 @@ fn linkVulkanLoader(
     }
 }
 
-//
 // ──────────────────────────────────────────────────────────────────────────────
 // Registry helpers (download to ./registry if missing)
 // ──────────────────────────────────────────────────────────────────────────────
-//
 fn ensureVkRegistry(b: *std.Build) std.Build.LazyPath {
     const rel = "registry/vk.xml";
     if (std.fs.cwd().openFile(rel, .{})) |f| {
@@ -180,7 +177,6 @@ fn addShaderBuildSteps(
 
     var missing_count: usize = 0;
 
-    // NOTE: plain `for` (runtime in the build runner) — no comptime control flow.
     for (stems) |stem| {
         const stage = detectStage(stem) orelse {
             std.log.warn("Unknown shader stage for {s}; expected .vert or .frag", .{stem});
@@ -209,14 +205,14 @@ fn addShaderBuildSteps(
                 shaders_step.dependOn(&cmd.step);
                 shaders_step.dependOn(&inst.step);
                 found = true;
-                break; // break inner loop (runtime)
+                break;
             }
 
             if (fileExists(src_spv_rel)) {
                 const inst2 = b.addInstallFileWithDir(b.path(src_spv_rel), .bin, install_dest);
                 shaders_step.dependOn(&inst2.step);
                 found = true;
-                break; // break inner loop (runtime)
+                break;
             }
         }
 
@@ -226,26 +222,21 @@ fn addShaderBuildSteps(
         }
     }
 
-    // Ensure the exe won’t run before shaders are staged/built.
     exe.step.dependOn(shaders_step);
     return shaders_step;
 }
 
-//
 // ──────────────────────────────────────────────────────────────────────────────
 // Test helper
 // ──────────────────────────────────────────────────────────────────────────────
-//
 fn addTestRun(b: *std.Build, root_mod: *std.Build.Module) *std.Build.Step.Run {
     const t = b.addTest(.{ .root_module = root_mod });
     return b.addRunArtifact(t);
 }
 
-//
 // ──────────────────────────────────────────────────────────────────────────────
 // Build graph
 // ──────────────────────────────────────────────────────────────────────────────
-//
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -394,7 +385,7 @@ pub fn build(b: *std.Build) void {
     // Install exe
     b.installArtifact(exe);
 
-    // Shaders (compile if sources exist; else stage precompiled .spv)
+    // Shaders
     const shaders_step = addShaderBuildSteps(b, exe, target);
 
     // Run
@@ -443,7 +434,6 @@ pub fn build(b: *std.Build) void {
     unit_step.dependOn(&run_math3d_tests.step);
     unit_step.dependOn(&run_camera3d_tests.step);
 
-    // Integration tests (optional)
     const have_integration = blk: {
         _ = std.fs.cwd().statFile("tests/test_all_integration.zig") catch break :blk false;
         break :blk true;
@@ -473,7 +463,6 @@ pub fn build(b: *std.Build) void {
         integration_step.dependOn(&run_integration.step);
     }
 
-    // E2E tests (optional)
     const have_e2e = blk2: {
         _ = std.fs.cwd().statFile("tests/test_all_e2e.zig") catch break :blk2 false;
         break :blk2 true;
@@ -503,7 +492,6 @@ pub fn build(b: *std.Build) void {
         e2e_step.dependOn(&run_e2e.step);
     }
 
-    // Aggregate
     const test_all_step = b.step("test-all", "Build vrgame + run unit, integration, and e2e tests");
     test_all_step.dependOn(b.getInstallStep());
     test_all_step.dependOn(unit_step);

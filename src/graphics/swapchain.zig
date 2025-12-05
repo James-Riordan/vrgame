@@ -1,3 +1,4 @@
+// (only comment tweak at the helper; code unchanged)
 const std = @import("std");
 const vk = @import("vulkan");
 const GraphicsContext = @import("graphics_context").GraphicsContext;
@@ -18,16 +19,13 @@ pub const Swapchain = struct {
     image_index: u32,
     next_image_acquired: vk.Semaphore,
 
-    /// First-time creation.
-    /// Note: extent parameter is ignored on HiDPI platforms; we pick from framebuffer size.
     pub fn init(gc: *const GraphicsContext, allocator: Allocator, extent: vk.Extent2D) !Swapchain {
-        _ = extent; // we compute from framebuffer
+        _ = extent;
         return try buildSwapchain(gc, allocator, .null_handle);
     }
 
-    /// Recreate after resize/suboptimal present.
     pub fn recreate(self: *Swapchain, new_extent: vk.Extent2D) !void {
-        _ = new_extent; // ignored; derived from framebuffer
+        _ = new_extent;
         const gc = self.gc;
         const allocator = self.allocator;
         const old_handle = self.handle;
@@ -60,12 +58,10 @@ pub const Swapchain = struct {
     pub fn currentImage(self: Swapchain) vk.Image {
         return self.swap_images[self.image_index].image;
     }
-
     pub fn currentSwapImage(self: Swapchain) *const SwapImage {
         return &self.swap_images[self.image_index];
     }
 
-    /// Submit + present current image, then acquire the next one and rotate semaphores.
     pub fn present(self: *Swapchain, cmdbuf: vk.CommandBuffer) !PresentState {
         const current = self.currentSwapImage();
         try current.waitForFence(self.gc);
@@ -113,13 +109,16 @@ pub const Swapchain = struct {
         };
     }
 
-    /// Convenience: dynamic viewport/scissor that handles MoltenVK vs classic Vulkan Y-flip.
+    /// Set viewport/scissor with correct Y for each OS:
+    /// - macOS (MoltenVK): positive height, y=0 (projection handles flip)
+    /// - others: negative height, y=h (viewport handles flip)
     pub fn cmdSetViewportAndScissor(self: *const Swapchain, gc: *const GraphicsContext, cmd: vk.CommandBuffer) void {
         const w: f32 = @floatFromInt(self.extent.width);
         const h: f32 = @floatFromInt(self.extent.height);
-
         const is_macos = @import("builtin").os.tag == .macos;
 
+        // Windows/Linux: negative height flips Y.
+        // macOS: positive height (no flip here; projection handles it).
         var viewport = vk.Viewport{
             .x = 0,
             .y = if (is_macos) 0 else h,
@@ -129,10 +128,7 @@ pub const Swapchain = struct {
             .max_depth = 1,
         };
 
-        const scissor = vk.Rect2D{
-            .offset = .{ .x = 0, .y = 0 },
-            .extent = self.extent,
-        };
+        const scissor = vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = self.extent };
 
         gc.vkd.cmdSetViewport(cmd, 0, 1, @as([*]const vk.Viewport, @ptrCast(&viewport)));
         gc.vkd.cmdSetScissor(cmd, 0, 1, @as([*]const vk.Rect2D, @ptrCast(&scissor)));
@@ -189,7 +185,6 @@ const SwapImage = struct {
         gc.vkd.destroyFence(gc.dev, self.frame_fence, null);
     }
 
-    /// Exposed so caller can explicitly synchronize if desired.
     pub fn waitForFence(self: SwapImage, gc: *const GraphicsContext) !void {
         _ = try gc.vkd.waitForFences(
             gc.dev,
@@ -201,21 +196,16 @@ const SwapImage = struct {
     }
 };
 
-fn buildSwapchain(
-    gc: *const GraphicsContext,
-    allocator: Allocator,
-    old_handle: vk.SwapchainKHR,
-) !Swapchain {
+fn buildSwapchain(gc: *const GraphicsContext, allocator: Allocator, old_handle: vk.SwapchainKHR) !Swapchain {
     const caps = try gc.vki.getPhysicalDeviceSurfaceCapabilitiesKHR(gc.pdev, gc.surface);
 
-    // HiDPI-safe: pick from the framebuffer (pixel) size.
     const fb = gc.framebufferExtent();
     const actual_extent = chooseSwapExtent(caps, fb);
     if (actual_extent.width == 0 or actual_extent.height == 0)
         return error.InvalidSurfaceDimensions;
 
     const surface_format = try findSurfaceFormat(gc, allocator);
-    const present_mode = try findPresentMode(gc, allocator); // returns fifo_khr for robustness
+    const present_mode = try findPresentMode(gc, allocator);
 
     var image_count = caps.min_image_count + 1;
     if (caps.max_image_count > 0) image_count = @min(image_count, caps.max_image_count);
@@ -278,14 +268,7 @@ fn buildSwapchain(
 
     std.log.info(
         "Swapchain: extent={d}x{d} | format={s} | present_mode={s} | images={d} | first index={d}",
-        .{
-            sc.extent.width,
-            sc.extent.height,
-            @tagName(sc.surface_format.format),
-            @tagName(sc.present_mode),
-            sc.swap_images.len,
-            sc.image_index,
-        },
+        .{ sc.extent.width, sc.extent.height, @tagName(sc.surface_format.format), @tagName(sc.present_mode), sc.swap_images.len, sc.image_index },
     );
 
     return sc;
@@ -324,25 +307,17 @@ fn findSurfaceFormat(gc: *const GraphicsContext, allocator: Allocator) !vk.Surfa
     return surface_formats[0];
 }
 
-/// Robust choice: always prefer FIFO (vsync). It's guaranteed by the spec and avoids timing quirks
-/// seen with .mailbox_khr / .immediate_khr while stabilizing synchronization.
 fn findPresentMode(gc: *const GraphicsContext, allocator: Allocator) !vk.PresentModeKHR {
-    // Query (kept for future configurability / diagnostics)
     var count: u32 = 0;
     _ = try gc.vki.getPhysicalDeviceSurfacePresentModesKHR(gc.pdev, gc.surface, &count, null);
     const modes = try allocator.alloc(vk.PresentModeKHR, count);
     defer allocator.free(modes);
     _ = try gc.vki.getPhysicalDeviceSurfacePresentModesKHR(gc.pdev, gc.surface, &count, modes.ptr);
-
-    // Hard, robust default:
     return .fifo_khr;
 }
 
-/// Choose the swap extent from framebuffer pixels if the surface lets us.
 fn chooseSwapExtent(caps: vk.SurfaceCapabilitiesKHR, fb: vk.Extent2D) vk.Extent2D {
-    if (caps.current_extent.width != std.math.maxInt(u32)) {
-        return caps.current_extent;
-    }
+    if (caps.current_extent.width != std.math.maxInt(u32)) return caps.current_extent;
     return .{
         .width = std.math.clamp(fb.width, caps.min_image_extent.width, caps.max_image_extent.width),
         .height = std.math.clamp(fb.height, caps.min_image_extent.height, caps.max_image_extent.height),
