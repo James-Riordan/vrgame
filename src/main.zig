@@ -31,11 +31,10 @@ const Allocator = std.mem.Allocator;
 const IS_MAC = builtin.os.tag == .macos;
 
 // Robust cross-platform rule:
-//   • Always flip Y in the *viewport* (negative height).
-//   • Do NOT flip the projection.
-// This matches Vulkan clip space on Win/Linux and MoltenVK on macOS.
-const VIEWPORT_Y_FLIP: bool = true;
-const PROJECTION_Y_FLIP: bool = false;
+// - On macOS (MoltenVK): flip the PROJECTION, keep viewport normal.
+// - On Win/Linux Vulkan: flip the VIEWPORT (negative height), keep projection normal.
+const VIEWPORT_Y_FLIP: bool = !IS_MAC;
+const PROJECTION_Y_FLIP: bool = IS_MAC;
 
 // Optional debug toggles
 const FORCE_DEBUG_FLAT_SHADERS: bool = false;
@@ -1693,6 +1692,14 @@ pub fn main() !void {
             instances_ptrs[img_index] + 1,
             CUBE_INSTANCES - 1,
         );
+
+        {
+            const ranges = [_]vk.MappedMemoryRange{
+                .{ .memory = ubo_mems[img_index], .offset = 0, .size = vk.WHOLE_SIZE },
+                .{ .memory = imems[img_index], .offset = 0, .size = vk.WHOLE_SIZE },
+            };
+            try gc.vkd.flushMappedMemoryRanges(gc.dev, @intCast(ranges.len), &ranges);
+        }
 
         // Heartbeat
         if (frame_count < 3 or (CONFIG.debug_heartbeat_every != 0 and (frame_count % CONFIG.debug_heartbeat_every) == 0)) {
